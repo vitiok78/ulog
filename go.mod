@@ -1,3 +1,3 @@
-module gitlab.boxberry.ru/union/go-ulog
+module github.com/vitiok78/ulog
 
 go 1.24

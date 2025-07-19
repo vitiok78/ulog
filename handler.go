@@ -136,21 +136,24 @@ func (h *Handler) extractValue(v slog.Value) interface{} {
 	switch v.Kind() {
 	case slog.KindAny:
 		// Handle special types
-		any := v.Any()
+		anyVal := v.Any()
 
 		// Handle errors
-		if err, ok := any.(error); ok {
+		if err, ok := anyVal.(error); ok {
 			return err.Error()
 		}
 
 		// Handle fmt.Stringer
-		if stringer, ok := any.(fmt.Stringer); ok {
+		if stringer, ok := anyVal.(fmt.Stringer); ok {
 			return stringer.String()
 		}
 
-		return any
+		return anyVal
 	case slog.KindLogValuer:
 		return h.extractValue(v.LogValuer().LogValue())
+	case slog.KindDuration:
+		// Handle duration values by converting to string
+		return v.Duration().String()
 	default:
 		return v.Any()
 	}

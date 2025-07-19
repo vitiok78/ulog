@@ -154,6 +154,18 @@ func (h *Handler) extractValue(v slog.Value) interface{} {
 	case slog.KindDuration:
 		// Handle duration values by converting to string
 		return v.Duration().String()
+	case slog.KindInt64:
+		return v.Int64()
+	case slog.KindUint64:
+		return v.Uint64()
+	case slog.KindFloat64:
+		return v.Float64()
+	case slog.KindString:
+		return v.String()
+	case slog.KindBool:
+		return v.Bool()
+	case slog.KindTime:
+		return v.Time()
 	default:
 		return v.Any()
 	}

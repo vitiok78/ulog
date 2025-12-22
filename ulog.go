@@ -27,6 +27,7 @@ type Config struct {
 	Channel    string
 	CtxKeyName string
 	AddSource  bool
+	Level      slog.Level
 }
 
 // DefaultConfig returns a default configuration with text formatter and os.Stderr output
@@ -37,6 +38,7 @@ func DefaultConfig() Config {
 		Channel:    "app",
 		AddSource:  false,
 		CtxKeyName: "ctx",
+		Level:      slog.LevelInfo,
 	}
 }
 

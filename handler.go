@@ -26,7 +26,7 @@ func NewHandler(config Config) *Handler {
 
 // Enabled implements slog.Handler interface
 func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
-	return true
+	return level >= h.config.Level
 }
 
 // Handle implements slog.Handler interface

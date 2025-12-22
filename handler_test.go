@@ -47,6 +47,7 @@ func TestNewHandler(t *testing.T) {
 		Channel:    "test",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
@@ -74,17 +75,27 @@ func TestHandlerEnabled(t *testing.T) {
 		Channel:    "test",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
 	ctx := context.Background()
 
-	// Test that Enabled always returns true (current implementation)
-	levels := []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError}
-	for _, level := range levels {
-		if !handler.Enabled(ctx, level) {
-			t.Errorf("Expected Enabled to return true for level %v", level)
-		}
+	// Test that Enabled respects the configured level
+	if handler.Enabled(ctx, slog.LevelDebug) {
+		t.Error("Expected Enabled to return false for DEBUG when level is INFO")
+	}
+
+	if !handler.Enabled(ctx, slog.LevelInfo) {
+		t.Error("Expected Enabled to return true for INFO when level is INFO")
+	}
+
+	if !handler.Enabled(ctx, slog.LevelWarn) {
+		t.Error("Expected Enabled to return true for WARN when level is INFO")
+	}
+
+	if !handler.Enabled(ctx, slog.LevelError) {
+		t.Error("Expected Enabled to return true for ERROR when level is INFO")
 	}
 }
 
@@ -96,6 +107,7 @@ func TestHandlerHandle(t *testing.T) {
 		Channel:    "test-channel",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
@@ -129,6 +141,7 @@ func TestHandlerHandleWithFormatterError(t *testing.T) {
 		Channel:    "test",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
@@ -154,6 +167,7 @@ func TestHandlerHandleWithWriterError(t *testing.T) {
 		Channel:    "test",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
@@ -178,6 +192,7 @@ func TestHandlerWithAttrs(t *testing.T) {
 		Channel:    "test",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
@@ -218,6 +233,7 @@ func TestHandlerWithGroup(t *testing.T) {
 		Channel:    "test",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
@@ -258,6 +274,7 @@ func TestHandlerAppendAttr(t *testing.T) {
 		Channel:    "test",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
@@ -325,6 +342,7 @@ func TestHandlerExtractValue(t *testing.T) {
 		Channel:    "test",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	}
 
 	handler := NewHandler(config)
@@ -373,6 +391,7 @@ func TestNewMultiHandler(t *testing.T) {
 		Channel:    "test1",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	handler2 := NewHandler(Config{
@@ -381,6 +400,7 @@ func TestNewMultiHandler(t *testing.T) {
 		Channel:    "test2",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	multiHandler := NewMultiHandler(handler1, handler2)
@@ -394,13 +414,14 @@ func TestNewMultiHandler(t *testing.T) {
 }
 
 func TestMultiHandlerEnabled(t *testing.T) {
-	// Test with only enabled handlers (our Handler always returns true for Enabled)
+	// Test with only enabled handlers
 	enabledHandler1 := NewHandler(Config{
 		Formatter:  &mockFormatter{},
 		Writer:     &mockWriter{},
 		Channel:    "test1",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	enabledHandler2 := NewHandler(Config{
@@ -409,6 +430,7 @@ func TestMultiHandlerEnabled(t *testing.T) {
 		Channel:    "test2",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	multiHandler := NewMultiHandler(enabledHandler1, enabledHandler2)
@@ -438,6 +460,7 @@ func TestMultiHandlerHandle(t *testing.T) {
 		Channel:    "test1",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	handler2 := NewHandler(Config{
@@ -446,6 +469,7 @@ func TestMultiHandlerHandle(t *testing.T) {
 		Channel:    "test2",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	multiHandler := NewMultiHandler(handler1, handler2)
@@ -478,6 +502,7 @@ func TestMultiHandlerHandleWithError(t *testing.T) {
 		Channel:    "test1",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	handler2 := NewHandler(Config{
@@ -486,6 +511,7 @@ func TestMultiHandlerHandleWithError(t *testing.T) {
 		Channel:    "test2",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	multiHandler := NewMultiHandler(handler1, handler2)
@@ -512,6 +538,7 @@ func TestMultiHandlerWithAttrs(t *testing.T) {
 		Channel:    "test1",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	handler2 := NewHandler(Config{
@@ -520,6 +547,7 @@ func TestMultiHandlerWithAttrs(t *testing.T) {
 		Channel:    "test2",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	multiHandler := NewMultiHandler(handler1, handler2)
@@ -546,6 +574,7 @@ func TestMultiHandlerWithGroup(t *testing.T) {
 		Channel:    "test1",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	handler2 := NewHandler(Config{
@@ -554,6 +583,7 @@ func TestMultiHandlerWithGroup(t *testing.T) {
 		Channel:    "test2",
 		CtxKeyName: "ctx",
 		AddSource:  false,
+		Level:      slog.LevelInfo,
 	})
 
 	multiHandler := NewMultiHandler(handler1, handler2)

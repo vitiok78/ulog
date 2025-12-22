@@ -86,7 +86,8 @@ config := ulog.Config{
     Writer:     os.Stderr,
     Channel:    "custom",
     CtxKeyName: "context",
-    AddSource:  true, // Add source file information
+    AddSource:  true,          // Add source file information
+    Level:      slog.LevelInfo, // Minimum log level
 }
 
 handler := ulog.New(config)
@@ -159,6 +160,29 @@ ULOG maps Go's slog levels to Symfony Monolog levels:
 | ERROR      | 400           | ERROR        |
 | Higher     | 500           | CRITICAL     |
 
+### Setting Minimum Log Level
+
+Control which logs are output by setting the minimum level in the configuration:
+
+```go
+config := ulog.Config{
+    Formatter: ulog.NewJSONFormatter(),
+    Writer:    os.Stdout,
+    Channel:   "app",
+    Level:     slog.LevelWarn, // Only WARN and above will be logged
+}
+
+handler := ulog.New(config)
+logger := slog.New(handler)
+
+logger.Debug("This won't be logged")
+logger.Info("This won't be logged either")
+logger.Warn("This will be logged")
+logger.Error("This will be logged too")
+```
+
+The default minimum level is `slog.LevelInfo`, which means DEBUG logs are filtered out by default.
+
 ## Output Formats
 
 ### Text Format
@@ -207,6 +231,7 @@ type Config struct {
     Channel    string       // Channel name for logs
     CtxKeyName string       // Context key name for attributes
     AddSource  bool         // Include source file information
+    Level      slog.Level   // Minimum log level to output
 }
 ```
 
@@ -220,6 +245,7 @@ config := ulog.DefaultConfig()
 // - "app" channel
 // - "ctx" context key name
 // - AddSource: false
+// - Level: slog.LevelInfo
 ```
 
 ## Thread Safety

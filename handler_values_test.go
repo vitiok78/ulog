@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // logOne logs one record through a JSON handler and returns its context.
@@ -281,5 +282,58 @@ func TestHandlerBoundsSharedLeafPayload(t *testing.T) {
 				t.Error("ok attribute lost")
 			}
 		})
+	}
+}
+
+// badTimeTree is sharedLeafTree with a time that JSON rejects (year 10000)
+// in a zone with a 64 KiB name: its fallback text is long.
+type badTimeTree struct{ level int }
+
+var badTime = time.Date(10000, 1, 1, 0, 0, 0, 0, time.FixedZone(strings.Repeat("z", 64<<10), 0))
+
+func (s badTimeTree) LogValue() slog.Value {
+	if s.level == 0 {
+		return slog.TimeValue(badTime)
+	}
+	return slog.GroupValue(slog.Any("l", badTimeTree{s.level - 1}), slog.Any("r", badTimeTree{s.level - 1}))
+}
+
+// TestHandlerMeasuresLeavesLikeFormatters: payload measurement must not
+// undercount (invalid times) or expand what the formatter bounds (shared
+// maps).
+func TestHandlerMeasuresLeavesLikeFormatters(t *testing.T) {
+	// 30 maps, each referencing the one below twice: 2^30 entries if
+	// encoded naively.
+	dag := map[string]interface{}{"leaf": 1}
+	for i := 0; i < 30; i++ {
+		dag = map[string]interface{}{"a": dag, "b": dag}
+	}
+
+	cases := map[string]func(*slog.Logger){
+		"bad times": func(l *slog.Logger) { l.Info("m", "v", badTimeTree{15}, "ok", "kept") },
+		"map dag":   func(l *slog.Logger) { l.Info("m", slog.Group("g", "dag", dag), "ok", "kept") },
+	}
+	for name, logIt := range cases {
+		for fname, f := range map[string]Formatter{"json": NewJSONFormatter(), "text": NewTextFormatter()} {
+			t.Run(name+"/"+fname, func(t *testing.T) {
+				var buf bytes.Buffer
+				l := slog.New(NewHandler(Config{Formatter: f, Writer: &buf, Channel: "test", Level: slog.LevelInfo}))
+
+				var before, after runtime.MemStats
+				runtime.GC()
+				runtime.ReadMemStats(&before)
+				logIt(l)
+				runtime.ReadMemStats(&after)
+
+				// Bounded by the 16 MiB payload budget times the per-leaf
+				// work (measure, then format); unbounded it is gigabytes.
+				if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 512<<20 {
+					t.Errorf("logging allocated %d MiB", allocated>>20)
+				}
+				if !strings.Contains(buf.String(), `"ok":"kept"`) {
+					t.Error("ok attribute lost")
+				}
+			})
+		}
 	}
 }

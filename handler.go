@@ -2,6 +2,7 @@ package ulog
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -155,9 +156,10 @@ func newAttrBudget() *attrBudget {
 	return &attrBudget{left: maxAttrExpansion, keyBytes: maxAttrKeyBytes, payloadBytes: maxAttrPayloadBytes}
 }
 
-// leafSize estimates the encoded size of an extracted value. Values that
-// are not plain strings or scalars are encoded to measure them; that cost
-// is bounded by the payload budget it is charged against.
+// leafSize measures the encoded size of an extracted value the way the
+// formatters will write it. Values that are not plain strings or scalars
+// are encoded to measure them; that cost is bounded by the payload budget
+// it is charged against.
 func leafSize(v interface{}) int {
 	switch x := v.(type) {
 	case nil:
@@ -167,7 +169,20 @@ func leafSize(v interface{}) int {
 	case bool, int64, uint64, float64:
 		return 24
 	case time.Time:
-		return 40
+		// Fixed size only when it encodes; otherwise the formatters write
+		// its fallback text, which can be long (a long zone name).
+		if data, err := x.MarshalJSON(); err == nil {
+			return len(data)
+		}
+		return len(describe(x)) + 2
+	case map[string]interface{}:
+		// Measure through the formatters' map encoding: it bounds repeated
+		// and cyclic references, which plain json.Marshal expands.
+		data, err := json.Marshal(encodeFields(x))
+		if err != nil {
+			return len(describe(x)) + 2
+		}
+		return len(data)
 	}
 	if data, err := marshalValue(v); err == nil {
 		return len(data)

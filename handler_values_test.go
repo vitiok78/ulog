@@ -2,6 +2,7 @@ package ulog
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -118,24 +119,44 @@ func TestHandlerBoundsSelfReferencingValuers(t *testing.T) {
 	}{
 		{"self", selfGroup{}, "[max group depth 64]"},
 		{"inline self", inlineSelfGroup{}, "[max group depth 64]"},
-		{"branching", branchingGroup{}, "[attribute limit reached: 100000 per record]"},
+		{"branching", branchingGroup{}, "[attribute limit reached: 100000 per value]"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := logOne(t, func(l *slog.Logger) { l.Info("m", "ok", "kept", "v", tt.value) })
+			// The runaway value comes first: everything after it, in the
+			// record, on the logger and in the request context, must stay.
+			var buf bytes.Buffer
+			h := NewHandler(Config{Formatter: NewJSONFormatter(), Writer: &buf, Channel: "test", CtxKeyName: "ctx", Level: slog.LevelInfo})
+			logger := slog.New(h).With("service", "api")
+			reqCtx := WithAttrsContext(context.Background(), slog.String("request_id", "req-1"))
+			logger.InfoContext(reqCtx, "m", "v", tt.value, "ok", "kept")
+
+			var parsed struct {
+				Context map[string]interface{} `json:"context"`
+			}
+			if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+				t.Fatalf("output is not one JSON record: %v", err)
+			}
+			got := parsed.Context
 
 			found := false
-			for _, v := range ctx {
+			for _, v := range got {
 				if v == tt.marker {
 					found = true
 					break
 				}
 			}
 			if !found {
-				t.Errorf("no %q among %d context entries", tt.marker, len(ctx))
+				t.Errorf("no %q among %d context entries", tt.marker, len(got))
 			}
-			if ctx["ok"] != "kept" {
-				t.Errorf("ok = %#v, want kept", ctx["ok"])
+			if got["ok"] != "kept" {
+				t.Errorf("ok = %#v, want kept", got["ok"])
+			}
+			if got["service"] != "api" {
+				t.Errorf("service = %#v, want api", got["service"])
+			}
+			if reqAttrs, _ := got["ctx"].(map[string]interface{}); reqAttrs["request_id"] != "req-1" {
+				t.Errorf("ctx = %#v, want request_id req-1", got["ctx"])
 			}
 		})
 	}

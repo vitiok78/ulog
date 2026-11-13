@@ -55,25 +55,23 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 	}
 
 	h.mu.RLock()
-	// One budget for the whole record, shared by all its attributes.
-	budget := newAttrBudget()
-
-	// Process attributes from the record
+	// Process attributes from the record. appendAttr gives each one its own
+	// expansion budget, so one runaway value cannot crowd out the others.
 	record.Attrs(func(attr slog.Attr) bool {
-		h.appendAttrBudget(logRecord.Context, attr, h.groups, 0, budget)
+		h.appendAttr(logRecord.Context, attr, h.groups)
 		return true
 	})
 
 	// Process pre-defined attributes
 	for _, attr := range h.attrs {
-		h.appendAttrBudget(logRecord.Context, attr, h.groups, 0, budget)
+		h.appendAttr(logRecord.Context, attr, h.groups)
 	}
 
 	// Extract attributes from context if available
 	if ctxAttrs := extractContextAttrs(ctx); len(ctxAttrs) > 0 {
 		ctxMap := make(map[string]interface{})
 		for _, attr := range ctxAttrs {
-			h.appendAttrBudget(ctxMap, attr, nil, 0, budget)
+			h.appendAttr(ctxMap, attr, nil)
 		}
 		logRecord.Context[h.config.CtxKeyName] = ctxMap
 	}
@@ -123,24 +121,33 @@ func (h *Handler) appendAttr(m map[string]interface{}, attr slog.Attr, groups []
 const (
 	// maxAttrDepth bounds group nesting within one attribute.
 	maxAttrDepth = 64
-	// maxAttrsPerRecord bounds how many attributes one record expands to.
-	maxAttrsPerRecord = 100_000
+	// maxAttrExpansion bounds how many attributes one top-level attribute
+	// expands to.
+	maxAttrExpansion = 100_000
 )
 
-// attrBudget is what one record may still expand. A LogValuer can return a
-// group that contains itself, or branches to itself twice; Resolve stops
-// only at the group, so without a shared budget expansion never ends.
+// attrBudget is what one top-level attribute may still expand. A LogValuer
+// can return a group that contains itself, or branches to itself twice;
+// Resolve stops only at the group, so without a budget expansion never ends.
+// Each top-level attribute gets its own, so one runaway value cannot crowd
+// out its siblings (a request ID logged after it, say).
 type attrBudget struct{ left int }
 
-func newAttrBudget() *attrBudget { return &attrBudget{left: maxAttrsPerRecord} }
+func newAttrBudget() *attrBudget { return &attrBudget{left: maxAttrExpansion} }
 
-// appendAttrBudget is appendAttr with the record's budget and the depth of
-// attr inside groups.
+// appendAttrBudget is appendAttr with the attribute's budget and its depth
+// inside groups.
 func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, groups []string, depth int, b *attrBudget) {
+	// Apply groups to the key
+	key := attr.Key
+	if len(groups) > 0 {
+		key = strings.Join(groups, ".") + "." + key
+	}
+
 	b.left--
 	if b.left < 0 {
 		if b.left == -1 {
-			m["ulog.truncated"] = fmt.Sprintf("[attribute limit reached: %d per record]", maxAttrsPerRecord)
+			m[key] = fmt.Sprintf("[attribute limit reached: %d per value]", maxAttrExpansion)
 		}
 		return
 	}
@@ -152,12 +159,6 @@ func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, gro
 
 	if attr.Equal(slog.Attr{}) {
 		return
-	}
-
-	// Apply groups to the key
-	key := attr.Key
-	if len(groups) > 0 {
-		key = strings.Join(groups, ".") + "." + key
 	}
 
 	if depth > maxAttrDepth {

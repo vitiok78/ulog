@@ -229,7 +229,9 @@ Both formatters encode context and extra values one by one. A value JSON
 rejects (a channel, a func, `NaN`, a struct holding one) is written as a string
 and the rest of the record is kept: its `String()`/`Error()` text if it has
 one, otherwise its `fmt` `%+v` dump. A value that refers to itself, or is too
-deep or large to print, is written as its type name only.
+deep or large to print, is written as its type name only. A nested map that
+appears several times in one record is written in full each time, up to 4 MiB
+of repeats; further copies are replaced by a marker.
 
 **Secrets:** the `%+v` dump includes fields JSON leaves out (`json:"-"`,
 unexported). This is deliberate: losing the log line is the bigger risk. Keep

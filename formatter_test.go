@@ -652,3 +652,66 @@ func TestDeepNestingStaysLinear(t *testing.T) {
 		})
 	}
 }
+
+// TestSharedMapsStayBounded: 31 maps, each referencing the one below twice,
+// with a value JSON rejects at the bottom. Expanded, that is 2^30 maps; the
+// formatter must finish quickly with bounded memory.
+func TestSharedMapsStayBounded(t *testing.T) {
+	var level interface{} = map[string]interface{}{"ch": make(chan int)}
+	for i := 0; i < 30; i++ {
+		level = map[string]interface{}{"a": level, "b": level}
+	}
+	record := LogRecord{Message: "shared", Context: map[string]interface{}{"root": level}}
+
+	for name, f := range map[string]Formatter{"json": NewJSONFormatter(), "text": NewTextFormatter()} {
+		t.Run(name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			output, err := f.Format(record)
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatalf("Format: %v", err)
+			}
+
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+				t.Errorf("Format allocated %d MiB", allocated>>20)
+			}
+			if !strings.Contains(string(output), "omitted") {
+				t.Error("output lacks the repeat marker")
+			}
+			if !strings.Contains(string(output), `"ch":"0x`) {
+				t.Error("output lacks the channel's dump")
+			}
+			if name == "json" && !json.Valid(output) {
+				t.Error("output is not valid JSON")
+			}
+		})
+	}
+}
+
+// TestSharedMapWrittenInFull: a map referenced twice, well under the repeat
+// budget, appears in full at both places.
+func TestSharedMapWrittenInFull(t *testing.T) {
+	shared := map[string]interface{}{"k": "v", "bad": func() {}}
+	record := LogRecord{Message: "twice", Context: map[string]interface{}{"x": shared, "y": shared}}
+
+	output, err := NewJSONFormatter().Format(record)
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	var parsed struct {
+		Context map[string]map[string]interface{} `json:"context"`
+	}
+	if err := json.Unmarshal(output, &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, output)
+	}
+	for _, key := range []string{"x", "y"} {
+		if parsed.Context[key]["k"] != "v" {
+			t.Errorf("context.%s = %v, want the full map", key, parsed.Context[key])
+		}
+		if _, ok := parsed.Context[key]["bad"].(string); !ok {
+			t.Errorf("context.%s.bad = %#v, want a string", key, parsed.Context[key]["bad"])
+		}
+	}
+}

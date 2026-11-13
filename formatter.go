@@ -105,46 +105,82 @@ func textFields(m map[string]interface{}) string {
 // map stays nil and encodes as null, as before.
 //
 // Each value is encoded once here to test it, and the result is copied once
-// more by the final Marshal. Nested maps are rebuilt, not re-encoded, so the
-// cost stays linear in the size of the value however deep it nests.
+// more by the final Marshal. Nested maps are rebuilt, not re-encoded, and a
+// map referenced several times is rebuilt once, so the work stays linear in
+// the number of distinct values.
 func encodeFields(m map[string]interface{}) map[string]interface{} {
-	return safeMap(m, map[uintptr]bool{})
-}
-
-// safeMap is encodeFields with the maps on the current path in seen, so a
-// map that contains itself ends in a string instead of recursing forever.
-func safeMap(m map[string]interface{}, seen map[uintptr]bool) map[string]interface{} {
 	if m == nil {
 		return nil
 	}
-
-	ptr := reflect.ValueOf(m).Pointer()
-	seen[ptr] = true
-	defer delete(seen, ptr)
-
-	out := make(map[string]interface{}, len(m))
-	for k, v := range m {
-		out[k] = safeValue(v, seen)
-	}
+	s := &safeState{path: map[uintptr]bool{}, done: map[uintptr]safeResult{}}
+	out, _ := s.safeMap(m)
 	return out
 }
 
-// safeValue returns v as a value json.Marshal accepts: its encoding as
-// json.RawMessage, or its description when v cannot be encoded. Nested
-// map[string]interface{} values (context groups) are made safe entry by
-// entry.
-func safeValue(v interface{}, seen map[uintptr]bool) interface{} {
+// maxRepeatedBytes bounds the output spent on extra copies of a nested map
+// that is referenced more than once. Repeats past it become a marker. A few
+// maps referencing each other twice per level would otherwise print
+// exponentially large; the first copy of every map is always written.
+const maxRepeatedBytes = 4 << 20
+
+// safeState carries one encodeFields call.
+type safeState struct {
+	path     map[uintptr]bool       // maps on the current path, for cycles
+	done     map[uintptr]safeResult // maps already rebuilt
+	repeated int                    // approximate bytes spent on repeats
+}
+
+// safeResult is a rebuilt map and the approximate size of its JSON.
+type safeResult struct {
+	out  map[string]interface{}
+	size int
+}
+
+// safeMap rebuilds m with every value made safe and returns it with its
+// approximate encoded size.
+func (s *safeState) safeMap(m map[string]interface{}) (map[string]interface{}, int) {
+	ptr := reflect.ValueOf(m).Pointer()
+	s.path[ptr] = true
+	defer delete(s.path, ptr)
+
+	out := make(map[string]interface{}, len(m))
+	size := 2 // {}
+	for k, v := range m {
+		var n int
+		out[k], n = s.safeValue(v)
+		size += len(k) + 4 + n // "k":v,
+	}
+	s.done[ptr] = safeResult{out: out, size: size}
+	return out, size
+}
+
+// safeValue returns v as a value json.Marshal accepts, with its approximate
+// encoded size: its encoding as json.RawMessage, or its description when v
+// cannot be encoded. Nested map[string]interface{} values (context groups)
+// are made safe entry by entry.
+func (s *safeState) safeValue(v interface{}) (interface{}, int) {
 	if nested, ok := v.(map[string]interface{}); ok && nested != nil {
-		if seen[reflect.ValueOf(nested).Pointer()] {
-			return fmt.Sprintf("[cyclic %T]", v)
+		ptr := reflect.ValueOf(nested).Pointer()
+		if s.path[ptr] {
+			marker := fmt.Sprintf("[cyclic %T]", v)
+			return marker, len(marker) + 2
 		}
-		return safeMap(nested, seen)
+		if r, ok := s.done[ptr]; ok {
+			if s.repeated+r.size > maxRepeatedBytes {
+				marker := fmt.Sprintf("[repeated %T omitted: written in full elsewhere in this record]", v)
+				return marker, len(marker) + 2
+			}
+			s.repeated += r.size
+			return r.out, r.size
+		}
+		return s.safeMap(nested)
 	}
 
 	if data, err := marshalValue(v); err == nil {
-		return json.RawMessage(data)
+		return json.RawMessage(data), len(data)
 	}
-	return describe(v)
+	desc := describe(v)
+	return desc, len(desc) + 2
 }
 
 // marshalValue is json.Marshal that turns a panic into an error.

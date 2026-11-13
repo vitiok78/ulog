@@ -47,7 +47,11 @@ Decisions taken:
   depth 64, 100 000 nodes) and prints only the type when it fails. Nested `map[string]interface{}` values
   (the ctx group) degrade per entry, with a cycle marker. They are rebuilt
   as a safe tree and marshalled once (third Codex review: re-encoding each
-  level as `RawMessage` copied a deep subtree once per level).
+  level as `RawMessage` copied a deep subtree once per level). A map
+  referenced more than once is rebuilt once and reused; extra copies are
+  written until 4 MiB of repeats, then replaced by a marker (fourth Codex
+  review: 31 maps referencing the one below twice expanded to 2^30 maps
+  and exhausted memory). The first copy is always written in full.
 - Archive name timestamps are parsed as UTC, only to recognise names and
   break ties (third Codex review: parsing in `time.Local` rejected names in
   the local DST gap, and those archives escaped retention for good).

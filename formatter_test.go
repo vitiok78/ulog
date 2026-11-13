@@ -3,6 +3,7 @@ package ulog
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"runtime"
 	"strings"
@@ -523,7 +524,7 @@ func TestDescribeIsSafe(t *testing.T) {
 
 	deep := map[string]interface{}{}
 	m := deep
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 300; i++ {
 		next := map[string]interface{}{}
 		m["next"] = next
 		m = next
@@ -551,11 +552,11 @@ func TestDescribeIsSafe(t *testing.T) {
 	}{
 		{"chan", make(chan int), "0x"},
 		{"nan", math.NaN(), "NaN"},
-		{"panicky", panicky{}, "[unprintable ulog.panicky]"},
-		{"self map", createCircularReference(), "[cyclic, too deep or too large map[string]interface {}]"},
-		{"self slice", selfSlice, "[cyclic, too deep or too large []interface {}]"},
-		{"too deep", deep, "[cyclic, too deep or too large"},
-		{"too large", lattice, "[cyclic, too deep or too large"},
+		{"panicky", panicky{}, "PANIC=String method: String boom"},
+		{"self map", createCircularReference(), "map[self:[cycle]]"},
+		{"self slice", selfSlice, "[[cycle]]"},
+		{"too deep", deep, "[max depth]"},
+		{"too large", lattice, "...[truncated at 4194304 bytes]"},
 		{"struct", cyclicStruct{}, "{Ch:<nil> Next:map[]}"},
 		{"pointer", &cyclicStruct{}, "&{Ch:<nil> Next:map[]}"},
 		{"shared, not cyclic", []interface{}{shared, shared}, "[map[a:1] map[a:1]]"},
@@ -565,9 +566,78 @@ func TestDescribeIsSafe(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := describe(tt.value); !strings.Contains(got, tt.want) {
-				t.Errorf("describe = %q, want it to contain %q", got, tt.want)
+				t.Errorf("describe = %.200q, want it to contain %q", got, tt.want)
 			}
 		})
+	}
+
+	if got := describe(lattice); len(got) > maxDescribeBytes+64 {
+		t.Errorf("describe(lattice) is %d bytes, want at most the cap plus the marker", len(got))
+	}
+}
+
+type fidelityInner struct {
+	A int
+	b string
+	S fmt.Stringer
+	E error
+}
+
+type fidelity struct {
+	Name   string
+	age    int
+	F32    float32
+	F64    float64
+	C      complex128
+	Inf    float64
+	Ptr    *fidelityInner
+	NilPtr *fidelityInner
+	Inner  fidelityInner
+	M      map[string]int
+	IM     map[int]string
+	Bytes  []byte
+	Arr    [2]bool
+	Any    interface{}
+	NilAny interface{}
+	St     stringerWithChan
+	hidden stringerWithChan
+	Err    error
+	U8     uint8
+	Fn     func()
+	NilFn  func()
+	Nested map[string]interface{}
+}
+
+// TestDumpMatchesFmt: for values without cycles or size problems, dump
+// prints exactly what fmt's %+v prints.
+func TestDumpMatchesFmt(t *testing.T) {
+	inner := fidelityInner{A: 1, b: "x", S: stringerWithChan{}}
+	full := fidelity{
+		Name: "n", age: 3, F32: 0.1, F64: 1e6, C: 1 + 2i, Inf: math.Inf(1),
+		Ptr: &inner, Inner: inner,
+		M:     map[string]int{"b": 2, "a": 1},
+		IM:    map[int]string{10: "x", 9: "y", -1: "z"},
+		Bytes: []byte("hi"), Arr: [2]bool{true, false},
+		Any: []int{1, 2}, Err: errors.New("e"), U8: 7, Fn: func() {},
+		Nested: map[string]interface{}{"k": []interface{}{nil, 1.5, "s"}, "e": errors.New("deep")},
+	}
+
+	values := []interface{}{
+		full,
+		&full,
+		inner,
+		map[interface{}]int{"b": 1, "a": 3, "c": 2},
+		map[interface{}]int{20: 1, 3: 2, -4: 3},
+		[]interface{}{nil, true, uint64(1 << 63), int8(-5), "s", stringerWithChan{}},
+		map[bool]string{true: "t", false: "f"},
+		[3]byte{1, 2, 3},
+		complex64(3 - 4i),
+	}
+	for i, v := range values {
+		want := fmt.Sprintf("%+v", v)
+		if got := dump(v); got != want {
+			t.Errorf("value %d:\n dump = %s\n fmt  = %s", i, got, want)
+		}
 	}
 }
 
@@ -747,12 +817,17 @@ func TestDumpOfSharedStringsStaysBounded(t *testing.T) {
 				t.Fatalf("Format: %v", err)
 			}
 
-			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+			// The record legitimately holds two 4 MiB dumps, which the
+			// formatters copy a few times. Before the cap it was 10+ GiB.
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<20 {
 				t.Errorf("Format allocated %d MiB", allocated>>20)
 			}
 			out := string(output)
-			if got := strings.Count(out, "too large to print"); got != 2 {
-				t.Errorf("%d too-large markers, want 2 (big, bytes): %.300s", got, out)
+			if got := strings.Count(out, "[truncated at 4194304 bytes]"); got != 2 {
+				t.Errorf("%d truncation markers, want 2 (big, bytes): %.300s", got, out)
+			}
+			if !strings.Contains(out, "Values:[ssss") || !strings.Contains(out, "Bytes:[0 0 0") {
+				t.Errorf("truncated values lost their beginning: %.300s", out)
 			}
 			if !strings.Contains(out, "Values:[a b]") {
 				t.Errorf("small value not dumped: %.300s", out)
@@ -795,8 +870,8 @@ func TestDumpOfSharedErrorsStaysBounded(t *testing.T) {
 				t.Errorf("Format allocated %d MiB", allocated>>20)
 			}
 			out := string(output)
-			if !strings.Contains(out, "too large to print") {
-				t.Errorf("big value not replaced by a marker: %.300s", out)
+			if !strings.Contains(out, "Errors:[xxxx") || !strings.Contains(out, "[truncated at 4194304 bytes]") {
+				t.Errorf("big value not truncated with its beginning kept: %.300s", out)
 			}
 			if !strings.Contains(out, "Err:boom") {
 				t.Errorf("small value's error not dumped: %.300s", out)

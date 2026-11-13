@@ -42,15 +42,14 @@ Decisions taken:
   `json:"-"` and unexported fields, so secrets can leak; it was briefly
   type-name-only. User decision 2026-11-13: logs must never lose content,
   the secret risk is accepted, so `%+v` is back (README says so,
-  `TestFormattersDumpUnencodableStructs` pins it). `%+v` has no cycle
-  detection, so a walk first checks the value (cycles through maps/slices,
-  depth 64, 100 000 nodes, ~4 MiB estimated output) and prints only the type
-  when it fails. The size estimate came from the fifth Codex review: a
-  struct with a channel and 16 384 references to one 64 KiB string printed
-  to over 1 GiB (the test measured 10+ GiB allocated before the fix).
-  Sixth review: the same through nested `Error()`/`String()`/`Format()`,
-  which fmt calls on nested values; the walk now calls them too and charges
-  the real output length (9+ GiB before the fix). Nested `map[string]interface{}` values
+  `TestFormattersDumpUnencodableStructs` pins it). fmt has no limits (it
+  loops forever on cycles and can print gigabytes from a small value), and
+  three Codex reviews in a row found ways past an up-front size estimate
+  (scalar slices, shared strings, nested `Error()`: 9–14 GiB in tests). So
+  the dump goes through our own printer (`dumper`): output identical to
+  `%+v` for ordinary values (`TestDumpMatchesFmt`), `[cycle]` where fmt
+  loops, `[max depth]` past 256 levels, and a hard 4 MiB cap that keeps the
+  beginning and appends `...[truncated at 4194304 bytes]`. Nested `map[string]interface{}` values
   (the ctx group) degrade per entry, with a cycle marker. They are rebuilt
   as a safe tree and marshalled once (third Codex review: re-encoding each
   level as `RawMessage` copied a deep subtree once per level). A map

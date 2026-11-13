@@ -1,10 +1,13 @@
 package ulog
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"strconv"
 	"time"
 )
 
@@ -195,162 +198,275 @@ func marshalValue(v interface{}) (data []byte, err error) {
 
 // describe returns a string for a value JSON cannot encode. It never panics.
 //
-// Losing the value is worse than exposing it, so describe shows as much as
-// it safely can: the value's String or Error text if it has one, otherwise
-// fmt's %+v. Note that %+v prints every field, including json:"-" and
-// unexported ones, so secrets JSON would hide can appear here.
+// Losing the value is worse than exposing it, so describe prints what fmt's
+// %+v would: the value's Format, Error or String output if it has one,
+// otherwise all of its fields, including json:"-" and unexported ones, so
+// secrets JSON would hide can appear here.
 //
-// fmt has no cycle detection and would recurse forever on a value that
-// refers to itself through a map or slice. Such a value, or one too deep or
-// too large to walk (see maxDescribeDepth, maxDescribeNodes), is named by
-// its type instead.
+// It does not call fmt on the value itself, because fmt has no limits: it
+// recurses forever on a value that refers to itself and can print gigabytes
+// from a small value that repeats one long string. describe prints through
+// dumper instead, which matches %+v for ordinary values, writes "[cycle]"
+// where fmt would loop, and stops at maxDescribeBytes with a marker.
 func describe(v interface{}) (s string) {
 	defer func() {
 		if r := recover(); r != nil {
 			s = fmt.Sprintf("[unprintable %T]", v)
 		}
 	}()
-
-	switch x := v.(type) {
-	case error:
-		return x.Error()
-	case fmt.Stringer:
-		return x.String()
-	}
-
-	b := describeBudget{nodes: maxDescribeNodes, bytes: maxDescribeBytes}
-	if !printable(reflect.ValueOf(v), 0, map[visit]bool{}, &b) {
-		if b.bytes < 0 && b.nodes >= 0 {
-			return fmt.Sprintf("[%T too large to print: over %d bytes]", v, maxDescribeBytes)
-		}
-		return fmt.Sprintf("[cyclic, too deep or too large %T]", v)
-	}
-	return fmt.Sprintf("%+v", v)
+	return dump(v)
 }
 
 const (
-	// maxDescribeDepth bounds how deep describe looks into a value.
-	maxDescribeDepth = 64
-	// maxDescribeNodes bounds how many values describe visits. A structure
-	// that shares maps or slices a lot can be exponentially larger printed
-	// than in memory.
-	maxDescribeNodes = 100_000
-	// maxDescribeBytes bounds the estimated size of the printed value. A
-	// slice holding one long string many times is small in memory and huge
-	// printed.
+	// maxDescribeBytes caps the output of describe.
 	maxDescribeBytes = 4 << 20
+	// maxDescribeDepth caps nesting; deeper values print as "[max depth]".
+	maxDescribeDepth = 256
+	// maxSortedKeys: maps with more entries print in iteration order rather
+	// than sorted, to avoid collecting and sorting all their keys.
+	maxSortedKeys = 100_000
 )
 
-// describeBudget is what printable may still spend.
-type describeBudget struct {
-	nodes int
-	bytes int
+// dumpFull unwinds a dumper when its output reaches the cap.
+type dumpFull struct{}
+
+// dumper prints values like fmt's %+v into a buffer of bounded size.
+type dumper struct {
+	buf   []byte
+	limit int
+	path  map[visit]bool // maps and slices on the current path
 }
 
-// spend takes n bytes and reports whether the budget still holds.
-func (b *describeBudget) spend(n int) bool {
-	b.bytes -= n
-	return b.bytes >= 0
-}
-
-// visit identifies a map or slice on the current path of printable.
+// visit identifies a map or slice on the current path of a dumper.
 type visit struct {
 	ptr uintptr
 	len int
 	typ reflect.Type
 }
 
-// printable reports whether fmt can print v in bounded time and space. It
-// follows what fmt follows: maps, slices, arrays, structs and interfaces at
-// any depth, and pointers only at the top level (deeper pointers print as
-// addresses), and estimates the printed size on the way. It is conservative:
-// it ignores String and Error methods that would stop fmt early.
-func printable(v reflect.Value, depth int, path map[visit]bool, b *describeBudget) bool {
-	b.nodes--
-	if depth > maxDescribeDepth || b.nodes < 0 {
-		return false
+// dump returns v printed like %+v, cut at maxDescribeBytes.
+func dump(v interface{}) (s string) {
+	d := &dumper{limit: maxDescribeBytes, path: map[visit]bool{}}
+	defer func() {
+		if r := recover(); r != nil {
+			if _, full := r.(dumpFull); !full {
+				panic(r)
+			}
+			d.buf = fmt.Appendf(d.buf, "...[truncated at %d bytes]", maxDescribeBytes)
+			s = string(d.buf)
+		}
+	}()
+	d.value(reflect.ValueOf(v), 0)
+	return string(d.buf)
+}
+
+// write appends s, or as much of it as fits and then stops the dump.
+func (d *dumper) write(s string) {
+	if room := d.limit - len(d.buf); len(s) > room {
+		d.buf = append(d.buf, s[:room]...)
+		panic(dumpFull{})
+	}
+	d.buf = append(d.buf, s...)
+}
+
+// value prints v following fmt's printValue for the %+v verb.
+func (d *dumper) value(v reflect.Value, depth int) {
+	if !v.IsValid() {
+		d.write("<nil>")
+		return
+	}
+	if depth > maxDescribeDepth {
+		d.write("[max depth]")
+		return
 	}
 
-	// Where fmt would call Format, Error or String, it prints the method's
-	// result instead of the value: charge that result. describe has already
-	// handled Error and String on the top-level value.
-	if v.IsValid() && v.CanInterface() && hasPrintMethod(v.Type(), depth) {
-		return b.spend(methodOutputLen(v.Interface()))
+	// fmt prints a value through its Format, Error or String method when
+	// it can reach the value (exported fields only).
+	if v.CanInterface() && hasPrintMethod(v.Type()) {
+		d.write(methodOutput(v.Interface()))
+		return
 	}
 
 	switch v.Kind() {
-	case reflect.Interface:
-		if v.IsNil() {
-			return b.spend(len("<nil>"))
-		}
-		return printable(v.Elem(), depth+1, path, b)
-
-	case reflect.Pointer:
-		if depth > 0 || v.IsNil() {
-			return b.spend(len("0xc000000000"))
-		}
-		return b.spend(1) && printable(v.Elem(), depth+1, path, b)
-
-	case reflect.Map:
-		if v.IsNil() {
-			return b.spend(len("map[]"))
-		}
-		key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
-		if path[key] {
-			return false
-		}
-		path[key] = true
-		defer delete(path, key)
-
-		if !b.spend(len("map[]")) {
-			return false
-		}
-		iter := v.MapRange()
-		for iter.Next() {
-			if !b.spend(2) || !printable(iter.Key(), depth+1, path, b) || !printable(iter.Value(), depth+1, path, b) {
-				return false
-			}
-		}
-		return true
-
-	case reflect.Slice:
-		if v.IsNil() {
-			return b.spend(len("[]"))
-		}
-		if !canNest(v.Type().Elem()) {
-			return scalarsFit(v, b)
-		}
-		key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
-		if path[key] {
-			return false
-		}
-		path[key] = true
-		defer delete(path, key)
-		return elementsPrintable(v, depth, path, b)
-
-	case reflect.Array:
-		if !canNest(v.Type().Elem()) {
-			return scalarsFit(v, b)
-		}
-		return elementsPrintable(v, depth, path, b)
-
-	case reflect.Struct:
-		if !b.spend(len("{}")) {
-			return false
-		}
-		t := v.Type()
-		for i := 0; i < v.NumField(); i++ {
-			if !b.spend(len(t.Field(i).Name)+2) || !printable(v.Field(i), depth+1, path, b) {
-				return false
-			}
-		}
-		return true
-
+	case reflect.Bool:
+		d.write(strconv.FormatBool(v.Bool()))
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		d.write(strconv.FormatInt(v.Int(), 10))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		d.write(strconv.FormatUint(v.Uint(), 10))
+	case reflect.Float32:
+		d.write(strconv.FormatFloat(v.Float(), 'g', -1, 32))
+	case reflect.Float64:
+		d.write(strconv.FormatFloat(v.Float(), 'g', -1, 64))
+	case reflect.Complex64:
+		d.write(fmt.Sprint(complex64(v.Complex())))
+	case reflect.Complex128:
+		d.write(fmt.Sprint(v.Complex()))
 	case reflect.String:
-		return b.spend(v.Len() + 1)
+		d.write(v.String())
+	case reflect.Interface:
+		d.value(v.Elem(), depth+1)
+	case reflect.Pointer:
+		// fmt follows a pointer only at the top level.
+		if depth == 0 && !v.IsNil() {
+			switch v.Elem().Kind() {
+			case reflect.Array, reflect.Slice, reflect.Struct, reflect.Map:
+				d.write("&")
+				d.value(v.Elem(), depth+1)
+				return
+			}
+		}
+		d.pointer(v)
+	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		d.pointer(v)
+	case reflect.Map:
+		d.mapValue(v, depth)
+	case reflect.Slice, reflect.Array:
+		d.list(v, depth)
+	case reflect.Struct:
+		d.structValue(v, depth)
+	default:
+		d.write("?")
+	}
+}
+
+func (d *dumper) pointer(v reflect.Value) {
+	if p := v.Pointer(); p != 0 {
+		d.write("0x" + strconv.FormatUint(uint64(p), 16))
+		return
+	}
+	d.write("<nil>")
+}
+
+// enter marks a map or slice as on the current path. It reports false, and
+// prints "[cycle]", when it already is: fmt would recurse forever there.
+func (d *dumper) enter(v reflect.Value) (visit, bool) {
+	key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
+	if d.path[key] {
+		d.write("[cycle]")
+		return key, false
+	}
+	d.path[key] = true
+	return key, true
+}
+
+func (d *dumper) mapValue(v reflect.Value, depth int) {
+	if v.IsNil() {
+		d.write("map[]")
+		return
+	}
+	key, ok := d.enter(v)
+	if !ok {
+		return
+	}
+	defer delete(d.path, key)
+
+	d.write("map[")
+	entry := func(i int, k, val reflect.Value) {
+		if i > 0 {
+			d.write(" ")
+		}
+		d.value(k, depth+1)
+		d.write(":")
+		d.value(val, depth+1)
+	}
+	if v.Len() > maxSortedKeys {
+		iter := v.MapRange()
+		for i := 0; iter.Next(); i++ {
+			entry(i, iter.Key(), iter.Value())
+		}
+	} else {
+		keys := v.MapKeys()
+		slices.SortStableFunc(keys, compareKeys)
+		for i, k := range keys {
+			entry(i, k, v.MapIndex(k))
+		}
+	}
+	d.write("]")
+}
+
+func (d *dumper) list(v reflect.Value, depth int) {
+	if v.Kind() == reflect.Slice {
+		if v.IsNil() {
+			d.write("[]")
+			return
+		}
+		key, ok := d.enter(v)
+		if !ok {
+			return
+		}
+		defer delete(d.path, key)
 	}
 
-	return b.spend(scalarSize(v.Kind()))
+	// fmt prints byte slices and arrays as decimals without methods.
+	bytes := v.Type().Elem().Kind() == reflect.Uint8
+	d.write("[")
+	for i := 0; i < v.Len(); i++ {
+		if i > 0 {
+			d.write(" ")
+		}
+		if bytes {
+			d.write(strconv.FormatUint(v.Index(i).Uint(), 10))
+		} else {
+			d.value(v.Index(i), depth+1)
+		}
+	}
+	d.write("]")
+}
+
+func (d *dumper) structValue(v reflect.Value, depth int) {
+	t := v.Type()
+	d.write("{")
+	for i := 0; i < v.NumField(); i++ {
+		if i > 0 {
+			d.write(" ")
+		}
+		d.write(t.Field(i).Name)
+		d.write(":")
+		field := v.Field(i)
+		if field.Kind() == reflect.Interface && !field.IsNil() {
+			field = field.Elem()
+		}
+		d.value(field, depth+1)
+	}
+	d.write("}")
+}
+
+// compareKeys orders map keys like fmt for the common key kinds. Other
+// kinds compare equal and keep map order.
+func compareKeys(a, b reflect.Value) int {
+	if a.Kind() == reflect.Interface && b.Kind() == reflect.Interface {
+		switch {
+		case a.IsNil() || b.IsNil():
+			return cmp.Compare(boolInt(!a.IsNil()), boolInt(!b.IsNil()))
+		case a.Elem().Type() != b.Elem().Type():
+			return cmp.Compare(a.Elem().Type().String(), b.Elem().Type().String())
+		}
+		return compareKeys(a.Elem(), b.Elem())
+	}
+
+	switch a.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return cmp.Compare(a.Int(), b.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return cmp.Compare(a.Uint(), b.Uint())
+	case reflect.String:
+		return cmp.Compare(a.String(), b.String())
+	case reflect.Float32, reflect.Float64:
+		return cmp.Compare(a.Float(), b.Float())
+	case reflect.Bool:
+		return cmp.Compare(boolInt(a.Bool()), boolInt(b.Bool()))
+	case reflect.Pointer, reflect.Chan, reflect.UnsafePointer:
+		return cmp.Compare(a.Pointer(), b.Pointer())
+	}
+	return 0
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 var (
@@ -359,82 +475,19 @@ var (
 	formatterType = reflect.TypeOf((*fmt.Formatter)(nil)).Elem()
 )
 
-// hasPrintMethod reports whether fmt's %+v prints a value of type t through
-// one of its methods. fmt calls Format at any depth, and Error and String
-// below the top level (printArg handles the top level, describe mirrors it).
-func hasPrintMethod(t reflect.Type, depth int) bool {
-	if t.Implements(formatterType) {
-		return true
-	}
-	return depth > 0 && (t.Implements(errorType) || t.Implements(stringerType))
+// hasPrintMethod reports whether %+v prints a value of type t through its
+// Format, Error or String method.
+func hasPrintMethod(t reflect.Type) bool {
+	return t.Implements(formatterType) || t.Implements(errorType) || t.Implements(stringerType)
 }
 
-// methodOutputLen is the length of what fmt prints for x through its method.
-func methodOutputLen(x interface{}) (n int) {
+// methodOutput is what %+v prints for x through its method. fmt itself turns
+// a panic in the method into a %!v(PANIC=...) note.
+func methodOutput(x interface{}) (s string) {
 	defer func() {
 		if r := recover(); r != nil {
-			n = len("%!v(PANIC=)")
+			s = "%!v(PANIC)"
 		}
 	}()
-	return len(fmt.Sprintf("%+v", x))
-}
-
-// elementsPrintable runs printable over the elements of a slice or array.
-func elementsPrintable(v reflect.Value, depth int, path map[visit]bool, b *describeBudget) bool {
-	if !b.spend(len("[]")) {
-		return false
-	}
-	for i := 0; i < v.Len(); i++ {
-		if !b.spend(1) || !printable(v.Index(i), depth+1, path, b) {
-			return false
-		}
-	}
-	return true
-}
-
-// scalarsFit spends the printed size of a slice or array of scalars. Strings
-// are summed one by one (they may all share one long string); other elements
-// are estimated from the count, without looking at each.
-func scalarsFit(v reflect.Value, b *describeBudget) bool {
-	if !b.spend(len("[]")) {
-		return false
-	}
-	if v.Type().Elem().Kind() != reflect.String {
-		n := v.Len()
-		size := scalarSize(v.Type().Elem().Kind()) + 1
-		if n > b.bytes/size {
-			b.bytes = -1
-			return false
-		}
-		return b.spend(n * size)
-	}
-	for i := 0; i < v.Len(); i++ {
-		if !b.spend(v.Index(i).Len() + 1) {
-			return false
-		}
-	}
-	return true
-}
-
-// scalarSize is the most fmt prints for one scalar of kind k, roughly.
-func scalarSize(k reflect.Kind) int {
-	switch k {
-	case reflect.Bool:
-		return len("false")
-	case reflect.Int8, reflect.Uint8:
-		return len("-128")
-	case reflect.Complex64, reflect.Complex128:
-		return 2*len("-1.7976931348623157e+308") + 3
-	}
-	return len("-1.7976931348623157e+308")
-}
-
-// canNest reports whether values of type t can contain other values that
-// fmt would print recursively.
-func canNest(t reflect.Type) bool {
-	switch t.Kind() {
-	case reflect.Interface, reflect.Pointer, reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
-		return true
-	}
-	return false
+	return fmt.Sprintf("%+v", x)
 }

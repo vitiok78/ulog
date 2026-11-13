@@ -55,7 +55,9 @@ Decisions taken:
   re-looked-up map values by key (NaN keys lost their value). Now methods
   are called directly, `Format` gets a capped `fmt.State`, a panic becomes
   `%!v(PANIC=<kind> method: <string payload or its type>)`, and map entries
-  come from `MapRange`. Nested `map[string]interface{}` values
+  come from `MapRange`. Eighth review: the panic note concatenated a string
+  payload before the cap (256 MiB payload: 525 MiB allocated); now written
+  piece by piece through the cap. Nested `map[string]interface{}` values
   (the ctx group) degrade per entry, with a cycle marker. They are rebuilt
   as a safe tree and marshalled once (third Codex review: re-encoding each
   level as `RawMessage` copied a deep subtree once per level). A map

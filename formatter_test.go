@@ -680,6 +680,31 @@ func (floodFormatter) Format(s fmt.State, _ rune) {
 	}
 }
 
+// bigPanicker panics with bigPanicPayload, set by the test that uses it.
+type bigPanicker struct{}
+
+var bigPanicPayload string
+
+func (bigPanicker) String() string { panic(bigPanicPayload) }
+
+func TestDumpPanicPayloadIsCapped(t *testing.T) {
+	bigPanicPayload = strings.Repeat("p", 256<<20) // built before measuring
+	t.Cleanup(func() { bigPanicPayload = "" })
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	got := describe([]interface{}{bigPanicker{}})
+	runtime.ReadMemStats(&after)
+
+	if !strings.HasPrefix(got, "[%!v(PANIC=String method: ppp") || !strings.HasSuffix(got, "[truncated at 4194304 bytes]") {
+		t.Errorf("unexpected output: %.60q ... %q", got, got[max(0, len(got)-40):])
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Errorf("describe allocated %d MiB for a 256 MiB panic payload", allocated>>20)
+	}
+}
+
 func TestDumpMethodsAreBounded(t *testing.T) {
 	got := describe([]interface{}{make(chan int), cyclicPanicker{}})
 	if want := "%!v(PANIC=String method: map[string]interface {})"; !strings.Contains(got, want) {

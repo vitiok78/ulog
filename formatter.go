@@ -519,13 +519,15 @@ func (d *dumper) method(x interface{}) {
 
 	var payload interface{}
 	if !safeCallPayload(func() { d.callMethod(x) }, &payload) {
-		note := "%!v(PANIC=" + kind + " method"
+		// Written piece by piece through the cap: the payload may be large.
+		d.stopIfFull()
+		d.write("%!v(PANIC=" + kind + " method: ")
 		if s, isString := payload.(string); isString {
-			note += ": " + s
+			d.write(s)
 		} else {
-			note += fmt.Sprintf(": %T", payload)
+			d.write(fmt.Sprintf("%T", payload))
 		}
-		d.write(note + ")")
+		d.write(")")
 	}
 	d.stopIfFull()
 }

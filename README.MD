@@ -278,7 +278,7 @@ config := ulog.DefaultConfig()
 
 ## Thread Safety
 
-All handlers are thread-safe and can be used concurrently across multiple goroutines. Internal mutex protection ensures data integrity during concurrent logging operations.
+All handlers are thread-safe and can be used concurrently across multiple goroutines. A handler serializes its writes, together with every handler derived from it by `WithAttrs` or `WithGroup`, so its writer does not have to be safe for concurrent use. `FileWriter` and `MultiWriter` are safe on their own. Two handlers made by separate `New...` calls do not share a lock: if they write to one writer, make it `FileWriter`, `MultiWriter` or `*os.File`, not a bare `bytes.Buffer` or `bufio.Writer`.
 
 ## Integration with Standard Library
 

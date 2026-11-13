@@ -4,23 +4,32 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Handler implements slog.Handler interface
+// Handler implements slog.Handler interface.
+//
+// Writes to Config.Writer are serialized across the handler and every handler
+// derived from it with WithAttrs or WithGroup, so the writer itself need not
+// be safe for concurrent use. Separate NewHandler calls on one writer do not
+// share that lock; give them a writer that is safe on its own (FileWriter,
+// MultiWriter, *os.File).
 type Handler struct {
-	config Config
-	attrs  []slog.Attr
-	groups []string
-	mu     sync.RWMutex
+	config  Config
+	attrs   []slog.Attr
+	groups  []string
+	mu      sync.RWMutex
+	writeMu *sync.Mutex // shared with derived handlers
 }
 
 // NewHandler creates a new ulog Handler
 func NewHandler(config Config) *Handler {
 	return &Handler{
-		config: config,
+		config:  config,
+		writeMu: &sync.Mutex{},
 	}
 }
 
@@ -73,6 +82,8 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 		return err
 	}
 
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
 	_, err = h.config.Writer.Write(formattedLog)
 	return err
 }
@@ -83,7 +94,10 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	defer h.mu.Unlock()
 	// Create a new handler with the same config
 	newHandler := NewHandler(h.config)
-	newHandler.attrs = append(h.attrs, attrs...)
+	newHandler.writeMu = h.writeMu
+	// Clip: without it, two handlers derived from h could append into the
+	// same spare capacity and overwrite each other's attributes.
+	newHandler.attrs = append(slices.Clip(h.attrs), attrs...)
 	return newHandler
 }
 
@@ -93,7 +107,8 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	defer h.mu.Unlock()
 	// Create a new handler with the same config
 	newHandler := NewHandler(h.config)
-	newHandler.groups = append(h.groups, name)
+	newHandler.writeMu = h.writeMu
+	newHandler.groups = append(slices.Clip(h.groups), name)
 	return newHandler
 }
 

@@ -233,9 +233,12 @@ nil receiver, or as `%!v(PANIC=String method: ...)`, like `fmt` does.
 `LogValue` is logged as slog's "LogValue panicked" error, and a `LogValuer`
 that returns a group is logged as that group. Groups nest at most 64 levels
 (deeper: `[max group depth 64]`), and one attribute expands to at most 100 000
-attributes, 16 MiB of flattened keys and 16 MiB of `Error()`/`String()` text
-(then an `[attribute limit reached: ...]` marker at that key, cut to 1 KiB),
+attributes, 16 MiB of flattened keys and 16 MiB of text produced by user
+methods: strings and `[]byte` returned by `LogValue()`, and `Error()`/`String()`
+text (then an `[attribute limit reached: ...]` marker at that key, cut to 1 KiB),
 so a `LogValuer` whose group contains itself cannot hang or crash the process.
+Not covered: a `LogValue()` that builds other large values (structs, slices)
+afresh at each of up to 100 000 distinct nodes.
 
 The formatters write at most 16 MiB of encoded values per record section
 (context, extra), counted from the bytes actually produced. A value that

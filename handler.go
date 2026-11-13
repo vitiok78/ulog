@@ -128,19 +128,20 @@ const (
 	// top-level attribute expands to. Keys repeat every group name above
 	// them, so long names in a cycle grow fast even under the other limits.
 	maxAttrKeyBytes = 16 << 20
-	// maxAttrMethodBytes bounds the Error() and String() text one top-level
-	// attribute's values produce. That text is built per occurrence, so a
-	// group tree repeating one Stringer builds it thousands of times. (The
-	// size of all other values is bounded where they are written, in the
-	// formatter.)
-	maxAttrMethodBytes = 16 << 20
+	// maxAttrProducedBytes bounds the text one top-level attribute's values
+	// produce through user methods: LogValue() results that are strings or
+	// []byte, and Error()/String() text. User methods run per occurrence, so
+	// a group tree repeating one value runs them thousands of times, and
+	// each result is retained until formatting. (Values that already exist
+	// are bounded where they are written, in the formatter.)
+	maxAttrProducedBytes = 16 << 20
 	// maxMarkerKeyBytes caps the key the limit marker is written under.
 	maxMarkerKeyBytes = 1024
 )
 
 // attrLimitMarker is written where an attribute's expansion was cut.
-var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes, %d key bytes or %d method-text bytes per value]",
-	maxAttrExpansion, maxAttrKeyBytes, maxAttrMethodBytes)
+var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes, %d key bytes or %d bytes from LogValue/Error/String per value]",
+	maxAttrExpansion, maxAttrKeyBytes, maxAttrProducedBytes)
 
 // attrBudget is what one top-level attribute may still expand. A LogValuer
 // can return a group that contains itself, or branches to itself twice;
@@ -148,13 +149,27 @@ var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes, %d k
 // Each top-level attribute gets its own, so one runaway value cannot crowd
 // out its siblings (a request ID logged after it, say).
 type attrBudget struct {
-	left        int // attributes
-	keyBytes    int // flattened key bytes
-	methodBytes int // Error() and String() text
+	left          int // attributes
+	keyBytes      int // flattened key bytes
+	producedBytes int // text from LogValue, Error and String
 }
 
 func newAttrBudget() *attrBudget {
-	return &attrBudget{left: maxAttrExpansion, keyBytes: maxAttrKeyBytes, methodBytes: maxAttrMethodBytes}
+	return &attrBudget{left: maxAttrExpansion, keyBytes: maxAttrKeyBytes, producedBytes: maxAttrProducedBytes}
+}
+
+// producedSize is the size of the text a resolved LogValue result holds:
+// strings and byte slices, which LogValue methods commonly build fresh.
+func producedSize(v slog.Value) int {
+	switch v.Kind() {
+	case slog.KindString:
+		return len(v.String())
+	case slog.KindAny:
+		if b, ok := v.Any().([]byte); ok {
+			return len(b)
+		}
+	}
+	return 0
 }
 
 // hasTextMethod reports whether extractValue turns v into the text of its
@@ -220,8 +235,19 @@ func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, gro
 
 	// Resolve LogValuers first, as slog asks handlers to: a LogValuer may
 	// resolve to a group. Resolve also turns a panicking LogValue into an
-	// error value and stops endless LogValue chains.
-	attr.Value = attr.Value.Resolve()
+	// error value and stops endless LogValue chains. LogValue is user code
+	// that may build its result fresh on every call: once the budget is
+	// spent, do not call it. Checked before, charged after, so a single
+	// value is always written in full.
+	if attr.Value.Kind() == slog.KindLogValuer {
+		if b.producedBytes <= 0 {
+			b.left = 0
+			m[key] = attrLimitMarker
+			return false
+		}
+		attr.Value = attr.Value.Resolve()
+		b.producedBytes -= producedSize(attr.Value)
+	}
 
 	if attr.Equal(slog.Attr{}) {
 		return true
@@ -250,7 +276,7 @@ func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, gro
 		// budget is spent, call no more. Checked before the call, charged
 		// after, so a single value is always written in full.
 		method := hasTextMethod(attr.Value)
-		if method && b.methodBytes <= 0 {
+		if method && b.producedBytes <= 0 {
 			b.left = 0
 			m[key] = attrLimitMarker
 			return false
@@ -259,7 +285,7 @@ func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, gro
 		// For non-group values, extract the value properly
 		val := h.extractValue(attr.Value)
 		if s, ok := val.(string); ok && method {
-			b.methodBytes -= len(s)
+			b.producedBytes -= len(s)
 		}
 		m[key] = val
 	}

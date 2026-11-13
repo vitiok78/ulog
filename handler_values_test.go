@@ -274,9 +274,11 @@ func TestHandlerBoundsSharedLeafPayload(t *testing.T) {
 			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<20 {
 				t.Errorf("logging allocated %d MiB", allocated>>20)
 			}
+			// LogValue results are charged in the handler: shared or
+			// fresh, a string returned by LogValue counts.
 			out := buf.String()
-			if !strings.Contains(out, valueLimitMarker) {
-				t.Errorf("no value limit marker in %d bytes of output", len(out))
+			if !strings.Contains(out, attrLimitMarker) {
+				t.Errorf("no attribute limit marker in %d bytes of output", len(out))
 			}
 			if !strings.Contains(out, `"ok":"kept"`) {
 				t.Error("ok attribute lost")
@@ -374,5 +376,49 @@ func TestHandlerBoundsMethodText(t *testing.T) {
 	}
 	if !strings.Contains(out, `"ok":"kept"`) {
 		t.Error("ok attribute lost")
+	}
+}
+
+// freshLeafTree builds a new 64 KiB string or byte slice at every leaf.
+type freshLeafTree struct {
+	level int
+	bytes bool
+}
+
+func (s freshLeafTree) LogValue() slog.Value {
+	if s.level == 0 {
+		if s.bytes {
+			return slog.AnyValue(make([]byte, 64<<10))
+		}
+		return slog.StringValue(strings.Repeat("x", 64<<10))
+	}
+	return slog.GroupValue(slog.Any("l", freshLeafTree{s.level - 1, s.bytes}), slog.Any("r", freshLeafTree{s.level - 1, s.bytes}))
+}
+
+// TestHandlerBoundsLogValueText: LogValue results are retained until
+// formatting, so fresh payloads at 2^15 leaves must stop being built.
+func TestHandlerBoundsLogValueText(t *testing.T) {
+	for name, bytesLeaf := range map[string]bool{"strings": false, "bytes": true} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			l := slog.New(NewHandler(Config{Formatter: NewJSONFormatter(), Writer: &buf, Channel: "test", Level: slog.LevelInfo}))
+
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			l.Info("m", "v", freshLeafTree{15, bytesLeaf}, "ok", "kept")
+			runtime.ReadMemStats(&after)
+
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<20 {
+				t.Errorf("logging allocated %d MiB", allocated>>20)
+			}
+			out := buf.String()
+			if !strings.Contains(out, attrLimitMarker) {
+				t.Errorf("no attribute limit marker in %d bytes of output", len(out))
+			}
+			if !strings.Contains(out, `"ok":"kept"`) {
+				t.Error("ok attribute lost")
+			}
+		})
 	}
 }

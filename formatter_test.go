@@ -2,6 +2,7 @@ package ulog
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"runtime"
 	"strings"
@@ -755,6 +756,50 @@ func TestDumpOfSharedStringsStaysBounded(t *testing.T) {
 			}
 			if !strings.Contains(out, "Values:[a b]") {
 				t.Errorf("small value not dumped: %.300s", out)
+			}
+		})
+	}
+}
+
+// TestDumpOfSharedErrorsStaysBounded: fmt prints nested errors through
+// Error(), so 16 384 references to one error with a 64 KiB message print to
+// over 1 GiB although they look like small pointers.
+func TestDumpOfSharedErrorsStaysBounded(t *testing.T) {
+	bigErr := errors.New(strings.Repeat("x", 64<<10))
+	errs := make([]error, 16<<10)
+	for i := range errs {
+		errs[i] = bigErr
+	}
+	type payload struct {
+		Ch     chan int
+		Errors []error
+		Err    error
+	}
+	record := LogRecord{Message: "errs", Context: map[string]interface{}{
+		"big":   payload{Ch: make(chan int), Errors: errs},
+		"small": payload{Ch: make(chan int), Err: errors.New("boom")},
+	}}
+
+	for name, f := range map[string]Formatter{"json": NewJSONFormatter(), "text": NewTextFormatter()} {
+		t.Run(name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			output, err := f.Format(record)
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatalf("Format: %v", err)
+			}
+
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+				t.Errorf("Format allocated %d MiB", allocated>>20)
+			}
+			out := string(output)
+			if !strings.Contains(out, "too large to print") {
+				t.Errorf("big value not replaced by a marker: %.300s", out)
+			}
+			if !strings.Contains(out, "Err:boom") {
+				t.Errorf("small value's error not dumped: %.300s", out)
 			}
 		})
 	}

@@ -47,7 +47,10 @@ Decisions taken:
   depth 64, 100 000 nodes, ~4 MiB estimated output) and prints only the type
   when it fails. The size estimate came from the fifth Codex review: a
   struct with a channel and 16 384 references to one 64 KiB string printed
-  to over 1 GiB (the test measured 10+ GiB allocated before the fix). Nested `map[string]interface{}` values
+  to over 1 GiB (the test measured 10+ GiB allocated before the fix).
+  Sixth review: the same through nested `Error()`/`String()`/`Format()`,
+  which fmt calls on nested values; the walk now calls them too and charges
+  the real output length (9+ GiB before the fix). Nested `map[string]interface{}` values
   (the ctx group) degrade per entry, with a cycle marker. They are rebuilt
   as a safe tree and marshalled once (third Codex review: re-encoding each
   level as `RawMessage` copied a deep subtree once per level). A map

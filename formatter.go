@@ -271,6 +271,13 @@ func printable(v reflect.Value, depth int, path map[visit]bool, b *describeBudge
 		return false
 	}
 
+	// Where fmt would call Format, Error or String, it prints the method's
+	// result instead of the value: charge that result. describe has already
+	// handled Error and String on the top-level value.
+	if v.IsValid() && v.CanInterface() && hasPrintMethod(v.Type(), depth) {
+		return b.spend(methodOutputLen(v.Interface()))
+	}
+
 	switch v.Kind() {
 	case reflect.Interface:
 		if v.IsNil() {
@@ -344,6 +351,32 @@ func printable(v reflect.Value, depth int, path map[visit]bool, b *describeBudge
 	}
 
 	return b.spend(scalarSize(v.Kind()))
+}
+
+var (
+	errorType     = reflect.TypeOf((*error)(nil)).Elem()
+	stringerType  = reflect.TypeOf((*fmt.Stringer)(nil)).Elem()
+	formatterType = reflect.TypeOf((*fmt.Formatter)(nil)).Elem()
+)
+
+// hasPrintMethod reports whether fmt's %+v prints a value of type t through
+// one of its methods. fmt calls Format at any depth, and Error and String
+// below the top level (printArg handles the top level, describe mirrors it).
+func hasPrintMethod(t reflect.Type, depth int) bool {
+	if t.Implements(formatterType) {
+		return true
+	}
+	return depth > 0 && (t.Implements(errorType) || t.Implements(stringerType))
+}
+
+// methodOutputLen is the length of what fmt prints for x through its method.
+func methodOutputLen(x interface{}) (n int) {
+	defer func() {
+		if r := recover(); r != nil {
+			n = len("%!v(PANIC=)")
+		}
+	}()
+	return len(fmt.Sprintf("%+v", x))
 }
 
 // elementsPrintable runs printable over the elements of a slice or array.

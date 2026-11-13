@@ -7,7 +7,34 @@ hit the first bug on staging; the other two came from a Codex review of
 impost on 2026-08-21. Line numbers below are for `main` at `bef41e3`
 (= v1.0.3 plus a `.gitignore` commit).
 
-Nothing here is started. No code in this repo was changed.
+## Status (2026-11-13)
+
+Code done on branch `fix-rotation`: bugs 1–3 and the three read-through
+findings, with tests; `go test ./...` green. Not yet merged, tagged or pushed;
+impost side not started.
+
+Decisions taken:
+
+- `maxAge` uses the timestamp parsed from the archive name, not ModTime.
+- Archive names gain a `.<n>` counter (n ≥ 1) when the name is taken; such
+  files count as archives and rank after the plain one of the same second.
+- Rename fails: the record is written to the active file and `Write` reports
+  nothing (returning an error with `n == len(p)` would break `bufio`-style
+  callers, which latch the first error). `size` restarts at 0, so the next
+  attempt comes after another `maxSize` bytes, not on every write.
+- Reopen fails: `Write` returns the error (that record is lost), `w.file` is
+  nil, the next `Write` opens again. Close errors during rotation are ignored.
+- `rotate` deliberately ignores `cleanOldBackups`' error (retention must not
+  stop logging; the next rotation retries). Tests call it directly.
+- New: an empty file is never rotated, so a record larger than `maxSize`
+  no longer leaves an empty archive. `TestFileWriterRotation` and
+  `TestFileWriterCleanOldBackups` now write twice.
+- Formatters: `fmt.Sprintf("%+v")` has no cycle detection and would overflow
+  the stack on a cyclic map, so the fallback first walks the value (cycles
+  through maps/slices, depth cap 64) and prints only the type when unsafe.
+  Nested `map[string]interface{}` values (the ctx group) degrade per entry.
+- `go test -race` fails on `TestMultiWriterConcurrentWrite`, also on `main`:
+  out of scope, see `docs/ai/todo/multiwriter-concurrency.md`.
 
 ## Goal
 

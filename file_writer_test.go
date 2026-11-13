@@ -1,9 +1,14 @@
 package ulog
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -244,11 +249,13 @@ func TestFileWriterRotation(t *testing.T) {
 	}
 	defer fw.Close()
 
-	// Write data that will trigger rotation
+	// Write data that will trigger rotation. An empty file is never rotated,
+	// so the first write only fills the file and the second one rotates it.
 	largeData := []byte(strings.Repeat("This is a log entry that will cause rotation\n", 3))
-	_, err = fw.Write(largeData)
-	if err != nil {
-		t.Errorf("Unexpected write error: %v", err)
+	for i := 0; i < 2; i++ {
+		if _, err := fw.Write(largeData); err != nil {
+			t.Errorf("Unexpected write error: %v", err)
+		}
 	}
 
 	// Check that backup files were created
@@ -269,6 +276,10 @@ func TestFileWriterRotation(t *testing.T) {
 	}
 }
 
+// TestFileWriterCleanOldBackups checks maxAge on pre-existing archives. Before
+// v1.0.4 it only asserted "at most 3 archives left"; every archive here is
+// older than maxAge, so age pruning removed them all and hid that the
+// maxBackups pass deleted the newest archives instead of the oldest.
 func TestFileWriterCleanOldBackups(t *testing.T) {
 	tempDir := t.TempDir()
 	logPath := filepath.Join(tempDir, "cleanup.log")
@@ -283,17 +294,7 @@ func TestFileWriterCleanOldBackups(t *testing.T) {
 	}
 
 	for _, backup := range oldBackups {
-		backupPath := filepath.Join(tempDir, backup)
-		file, err := os.Create(backupPath)
-		if err != nil {
-			t.Fatalf("Failed to create backup file %s: %v", backup, err)
-		}
-		file.WriteString("old backup content")
-		file.Close()
-
-		// Set old modification time
-		oldTime := time.Now().Add(-10 * 24 * time.Hour) // 10 days ago
-		os.Chtimes(backupPath, oldTime, oldTime)
+		writeFile(t, filepath.Join(tempDir, backup), "old backup content")
 	}
 
 	// Create FileWriter with maxBackups=3 and maxAge=7 days
@@ -303,29 +304,23 @@ func TestFileWriterCleanOldBackups(t *testing.T) {
 	}
 	defer fw.Close()
 
-	// Trigger rotation which should clean old backups
+	// Fill the file, then trigger rotation which should clean old backups
 	largeData := []byte(strings.Repeat("Data to trigger rotation and cleanup\n", 3))
-	_, err = fw.Write(largeData)
-	if err != nil {
-		t.Errorf("Unexpected write error: %v", err)
-	}
-
-	// Check remaining files
-	files, err := os.ReadDir(tempDir)
-	if err != nil {
-		t.Fatalf("Failed to read temp directory: %v", err)
-	}
-
-	backupCount := 0
-	for _, file := range files {
-		if strings.Contains(file.Name(), "cleanup.log.") && !strings.HasSuffix(file.Name(), ".log") {
-			backupCount++
+	for i := 0; i < 2; i++ {
+		if _, err := fw.Write(largeData); err != nil {
+			t.Errorf("Unexpected write error: %v", err)
 		}
 	}
 
-	// Should have at most maxBackups (3) backup files
-	if backupCount > 3 {
-		t.Errorf("Expected at most 3 backup files, found %d", backupCount)
+	// Only the archive made just now is younger than maxAge.
+	archives := listArchives(t, tempDir, "cleanup.log")
+	if len(archives) != 1 {
+		t.Fatalf("Expected 1 archive (the new one), found %v", archives)
+	}
+	for _, old := range oldBackups {
+		if archives[0] == old {
+			t.Errorf("Archive %s is older than maxAge and should be removed", old)
+		}
 	}
 }
 
@@ -380,4 +375,363 @@ func TestFileWriterImplementsInterfaces(t *testing.T) {
 	// Test that FileWriter implements required interfaces
 	var _ Writer = fw
 	var _ io.Writer = fw
+}
+
+// testClockStart is the fake time tests start from.
+var testClockStart = time.Date(2026, 11, 13, 12, 0, 0, 0, time.Local)
+
+// newTestWriter returns a FileWriter on <tempdir>/app.log with a fake clock.
+// Assign through the returned pointer to move the clock.
+func newTestWriter(t *testing.T, maxSize int64, maxBackups, maxAge int) (*FileWriter, string, *time.Time) {
+	t.Helper()
+	dir := t.TempDir()
+	fw, err := NewFileWriter(filepath.Join(dir, "app.log"), maxSize, maxBackups, maxAge)
+	if err != nil {
+		t.Fatalf("NewFileWriter: %v", err)
+	}
+	t.Cleanup(func() { fw.Close() })
+
+	clock := testClockStart
+	fw.now = func() time.Time { return clock }
+	return fw, dir, &clock
+}
+
+func mustWrite(t *testing.T, fw *FileWriter, s string) {
+	t.Helper()
+	n, err := fw.Write([]byte(s))
+	if err != nil {
+		t.Fatalf("Write(%q): %v", s, err)
+	}
+	if n != len(s) {
+		t.Fatalf("Write(%q) wrote %d bytes, want %d", s, n, len(s))
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile(%s): %v", path, err)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+	return string(data)
+}
+
+// listArchives returns the sorted names in dir that cleanOldBackups treats
+// as archives of base.
+func listArchives(t *testing.T, dir, base string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var names []string
+	for _, entry := range entries {
+		suffix, ok := strings.CutPrefix(entry.Name(), base+".")
+		if !ok || entry.IsDir() {
+			continue
+		}
+		if _, _, ok := parseArchiveSuffix(suffix); ok {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func archiveName(base string, ts time.Time) string {
+	return base + "." + ts.Format(archiveLayout)
+}
+
+func skipIfPermissionsIgnored(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions do not block writes on windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+}
+
+func TestFileWriterMaxBackupsKeepsNewest(t *testing.T) {
+	fw, dir, clock := newTestWriter(t, 10, 3, 0)
+
+	// Each record fills the file, so every write after the first rotates.
+	// The archive holding record k is made at testClockStart + (k+1)s.
+	for i := 0; i < 8; i++ {
+		mustWrite(t, fw, fmt.Sprintf("record %02d\n", i))
+		*clock = clock.Add(time.Second)
+	}
+
+	var want []string
+	for k := 4; k <= 6; k++ {
+		want = append(want, archiveName("app.log", testClockStart.Add(time.Duration(k+1)*time.Second)))
+	}
+	got := listArchives(t, dir, "app.log")
+	if !slices.Equal(got, want) {
+		t.Fatalf("archives = %v, want the newest three %v", got, want)
+	}
+	for i, name := range want {
+		if content, wantContent := readFile(t, filepath.Join(dir, name)), fmt.Sprintf("record %02d\n", i+4); content != wantContent {
+			t.Errorf("%s holds %q, want %q", name, content, wantContent)
+		}
+	}
+	if content := readFile(t, filepath.Join(dir, "app.log")); content != "record 07\n" {
+		t.Errorf("active file holds %q, want %q", content, "record 07\n")
+	}
+}
+
+func TestFileWriterForeignFilesSurvive(t *testing.T) {
+	fw, dir, clock := newTestWriter(t, 10, 2, 1)
+
+	foreign := []string{
+		"app.log.keep-me",
+		"app.log.gz",
+		"app.log.20200101-000000.bak",
+		"app.log.20201301-000000", // month 13
+		"app.log.20200101-00000",  // one digit short
+		"app.log.20200101-000000.0",
+		"app.log.20200101-000000.01",
+		"app.log.20200101-000000.+1",
+		"app.logx.20200101-000000",
+	}
+	for _, name := range foreign {
+		writeFile(t, filepath.Join(dir, name), "not an archive")
+	}
+	// A directory with an archive name is not an archive either.
+	if err := os.Mkdir(filepath.Join(dir, "app.log.20200102-000000"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 5; i++ {
+		mustWrite(t, fw, fmt.Sprintf("record %02d\n", i))
+		*clock = clock.Add(time.Second)
+	}
+
+	for _, name := range append(foreign, "app.log.20200102-000000") {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("foreign file %s was removed: %v", name, err)
+		}
+	}
+	// Foreign files do not count against maxBackups.
+	if got := listArchives(t, dir, "app.log"); len(got) != 2 {
+		t.Errorf("archives = %v, want 2", got)
+	}
+}
+
+func TestFileWriterMaxAgeAndMaxBackups(t *testing.T) {
+	ages := []time.Duration{
+		10 * 24 * time.Hour,
+		8 * 24 * time.Hour,
+		4 * time.Hour,
+		3 * time.Hour,
+		2 * time.Hour,
+		1 * time.Hour,
+	}
+
+	tests := []struct {
+		name       string
+		maxBackups int
+		want       []time.Duration // ages of the surviving archives; 0 = the new one
+	}{
+		{"both limits", 3, []time.Duration{0, time.Hour, 2 * time.Hour}},
+		{"age only", 0, []time.Duration{0, time.Hour, 2 * time.Hour, 3 * time.Hour, 4 * time.Hour}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw, dir, _ := newTestWriter(t, 10, tt.maxBackups, 7)
+			for _, age := range ages {
+				writeFile(t, filepath.Join(dir, archiveName("app.log", testClockStart.Add(-age))), "old")
+			}
+
+			mustWrite(t, fw, "record 00\n")
+			mustWrite(t, fw, "record 01\n") // rotates at testClockStart
+
+			var want []string
+			for _, age := range tt.want {
+				want = append(want, archiveName("app.log", testClockStart.Add(-age)))
+			}
+			sort.Strings(want)
+			if got := listArchives(t, dir, "app.log"); !slices.Equal(got, want) {
+				t.Errorf("archives = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestFileWriterSameSecondRotations(t *testing.T) {
+	fw, dir, _ := newTestWriter(t, 10, 0, 0)
+
+	// The clock does not move: three rotations within one second.
+	for i := 0; i < 4; i++ {
+		mustWrite(t, fw, fmt.Sprintf("record %02d\n", i))
+	}
+
+	base := archiveName("app.log", testClockStart)
+	want := []string{base, base + ".1", base + ".2"}
+	if got := listArchives(t, dir, "app.log"); !slices.Equal(got, want) {
+		t.Fatalf("archives = %v, want %v", got, want)
+	}
+	for i, name := range want {
+		if content, wantContent := readFile(t, filepath.Join(dir, name)), fmt.Sprintf("record %02d\n", i); content != wantContent {
+			t.Errorf("%s holds %q, want %q", name, content, wantContent)
+		}
+	}
+
+	// Within one second the counter orders the archives.
+	fw.maxBackups = 2
+	if err := fw.cleanOldBackups(); err != nil {
+		t.Fatalf("cleanOldBackups: %v", err)
+	}
+	if got, want := listArchives(t, dir, "app.log"), []string{base + ".1", base + ".2"}; !slices.Equal(got, want) {
+		t.Errorf("after cleanup archives = %v, want %v", got, want)
+	}
+}
+
+func TestFileWriterCleanOldBackupsReportsRemoveError(t *testing.T) {
+	skipIfPermissionsIgnored(t)
+	fw, dir, _ := newTestWriter(t, 0, 1, 0)
+	for i := 1; i <= 3; i++ {
+		writeFile(t, filepath.Join(dir, archiveName("app.log", testClockStart.Add(-time.Duration(i)*time.Hour))), "old")
+	}
+
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0755) })
+
+	if err := fw.cleanOldBackups(); err == nil {
+		t.Error("cleanOldBackups returned nil, want the removal error")
+	}
+}
+
+func TestFileWriterOversizedRecordOnEmptyFile(t *testing.T) {
+	fw, dir, _ := newTestWriter(t, 10, 0, 0)
+
+	big := strings.Repeat("x", 50) + "\n"
+	mustWrite(t, fw, big)
+	if got := listArchives(t, dir, "app.log"); len(got) != 0 {
+		t.Fatalf("archives = %v, want none: an empty file must not be rotated", got)
+	}
+
+	mustWrite(t, fw, "next\n")
+	got := listArchives(t, dir, "app.log")
+	if len(got) != 1 || readFile(t, filepath.Join(dir, got[0])) != big {
+		t.Errorf("archives = %v, want one holding the big record", got)
+	}
+}
+
+func TestFileWriterRenameFailureKeepsWriting(t *testing.T) {
+	fw, dir, _ := newTestWriter(t, 10, 0, 0)
+	fw.rename = func(string, string) error { return errors.New("injected rename failure") }
+
+	mustWrite(t, fw, "record 00\n")
+	mustWrite(t, fw, "record 01\n") // rotation fails, record still written
+	mustWrite(t, fw, "record 02\n")
+
+	if got := listArchives(t, dir, "app.log"); len(got) != 0 {
+		t.Fatalf("archives = %v, want none", got)
+	}
+	active := filepath.Join(dir, "app.log")
+	if got, want := readFile(t, active), "record 00\nrecord 01\nrecord 02\n"; got != want {
+		t.Fatalf("active file holds %q, want %q", got, want)
+	}
+
+	// Once rename works again, rotation resumes.
+	fw.rename = os.Rename
+	mustWrite(t, fw, "record 03\n")
+	got := listArchives(t, dir, "app.log")
+	if len(got) != 1 || readFile(t, filepath.Join(dir, got[0])) != "record 00\nrecord 01\nrecord 02\n" {
+		t.Errorf("archives = %v, want one holding records 00-02", got)
+	}
+	if got := readFile(t, active); got != "record 03\n" {
+		t.Errorf("active file holds %q, want %q", got, "record 03\n")
+	}
+}
+
+func TestFileWriterRenameFailureReadOnlyDir(t *testing.T) {
+	skipIfPermissionsIgnored(t)
+	fw, dir, _ := newTestWriter(t, 10, 3, 0)
+
+	if err := os.Chmod(dir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0755) })
+
+	mustWrite(t, fw, "record 00\n")
+	mustWrite(t, fw, "record 01\n") // the real rename fails
+	mustWrite(t, fw, "record 02\n")
+
+	if got, want := readFile(t, filepath.Join(dir, "app.log")), "record 00\nrecord 01\nrecord 02\n"; got != want {
+		t.Errorf("active file holds %q, want %q", got, want)
+	}
+}
+
+func TestFileWriterReopenFailureRecovers(t *testing.T) {
+	fw, dir, _ := newTestWriter(t, 10, 0, 0)
+
+	mustWrite(t, fw, "record 00\n")
+
+	failures := 1
+	fw.openFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		if failures > 0 {
+			failures--
+			return nil, errors.New("injected open failure")
+		}
+		return os.OpenFile(name, flag, perm)
+	}
+
+	// Rename succeeds, the new file cannot be opened: this record is lost.
+	if _, err := fw.Write([]byte("record 01\n")); err == nil {
+		t.Fatal("Write returned nil, want the open error")
+	}
+	if fw.file != nil {
+		t.Fatal("writer kept a closed file handle")
+	}
+
+	// The next write opens the file again.
+	mustWrite(t, fw, "record 02\n")
+	if got := readFile(t, filepath.Join(dir, "app.log")); got != "record 02\n" {
+		t.Errorf("active file holds %q, want %q", got, "record 02\n")
+	}
+	got := listArchives(t, dir, "app.log")
+	if len(got) != 1 || readFile(t, filepath.Join(dir, got[0])) != "record 00\n" {
+		t.Errorf("archives = %v, want one holding record 00", got)
+	}
+}
+
+func TestFileWriterCloseFailureDuringRotation(t *testing.T) {
+	fw, dir, _ := newTestWriter(t, 10, 0, 0)
+	fw.closeFile = func(f *os.File) error {
+		f.Close()
+		return errors.New("injected close failure")
+	}
+
+	mustWrite(t, fw, "record 00\n")
+	mustWrite(t, fw, "record 01\n")
+
+	if got := readFile(t, filepath.Join(dir, "app.log")); got != "record 01\n" {
+		t.Errorf("active file holds %q, want %q", got, "record 01\n")
+	}
+	got := listArchives(t, dir, "app.log")
+	if len(got) != 1 || readFile(t, filepath.Join(dir, got[0])) != "record 00\n" {
+		t.Errorf("archives = %v, want one holding record 00", got)
+	}
+}
+
+func TestFileWriterWriteAfterClose(t *testing.T) {
+	fw, _, _ := newTestWriter(t, 0, 0, 0)
+	if err := fw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := fw.Write([]byte("late\n")); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("Write after Close = %v, want os.ErrClosed", err)
+	}
 }

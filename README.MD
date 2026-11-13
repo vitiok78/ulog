@@ -208,8 +208,24 @@ The default minimum level is `slog.LevelInfo`, which means DEBUG logs are filter
 The file writer supports automatic rotation based on:
 
 - **Size**: Rotate when file reaches maximum size
-- **Age**: Rotate files older than specified days
-- **Backup Count**: Keep only specified number of backup files
+- **Age**: Remove archives older than the given number of days
+- **Backup Count**: Keep only the newest given number of archives
+
+Archives are named `<path>.<YYYYMMDD-HHMMSS>`, with a `.1`, `.2`, … suffix when
+several rotations happen within one second. Only files named exactly like that
+count as archives; other files next to the log (`app.log.gz`, `app.log.keep-me`)
+are never counted or removed. Archive age comes from the timestamp in the name.
+
+A failed rotation does not stop logging: if the file cannot be renamed, records
+keep going to the active file and rotation is retried later; if the new file
+cannot be opened, the next write opens it again. `Write` after `Close` returns
+`os.ErrClosed`.
+
+### Values JSON cannot encode
+
+Both formatters encode context and extra values one by one. A value JSON
+rejects (a channel, a func, `NaN`, a cyclic structure) is written as its
+`fmt` `%+v` string, and the rest of the record is kept.
 
 ### Size Parsing
 

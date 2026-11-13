@@ -2,6 +2,7 @@ package ulog
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -379,4 +380,177 @@ func createCircularReference() map[string]interface{} {
 	m := make(map[string]interface{})
 	m["self"] = m // This creates a circular reference
 	return m
+}
+
+// panicky fails both JSON encoding and printing by panicking.
+type panicky struct{}
+
+func (panicky) MarshalJSON() ([]byte, error) { panic("MarshalJSON boom") }
+func (panicky) String() string               { panic("String boom") }
+
+// cyclicStruct refers to itself through a map, which fmt would print forever.
+type cyclicStruct struct {
+	Ch   chan int
+	Next map[string]interface{}
+}
+
+// badRecord holds values JSON cannot encode next to normal ones.
+func badRecord() LogRecord {
+	cyclic := cyclicStruct{Ch: make(chan int), Next: map[string]interface{}{}}
+	cyclic.Next["back"] = cyclic
+
+	selfSlice := make([]interface{}, 1)
+	selfSlice[0] = selfSlice
+
+	return LogRecord{
+		Message:   "bad values",
+		Channel:   "test",
+		Level:     200,
+		LevelName: "INFO",
+		DateTime:  time.Now(),
+		Context: map[string]interface{}{
+			"ok":        "value",
+			"n":         42,
+			"ch":        make(chan int),
+			"fn":        func() {},
+			"nan":       math.NaN(),
+			"cycle":     createCircularReference(),
+			"panicky":   panicky{},
+			"cyclic":    cyclic,
+			"selfSlice": selfSlice,
+			"group":     map[string]interface{}{"inner": "kept", "bad": func() {}},
+		},
+		Extra: map[string]interface{}{
+			"e":   "x",
+			"bad": make(chan string),
+		},
+	}
+}
+
+// checkBadValues asserts the encoded context and extra of badRecord.
+func checkBadValues(t *testing.T, context, extra map[string]interface{}) {
+	t.Helper()
+
+	if context["ok"] != "value" {
+		t.Errorf("context.ok = %v, want value", context["ok"])
+	}
+	if context["n"] != float64(42) {
+		t.Errorf("context.n = %v, want 42", context["n"])
+	}
+	if context["nan"] != "NaN" {
+		t.Errorf("context.nan = %v, want \"NaN\"", context["nan"])
+	}
+	for _, key := range []string{"ch", "fn", "panicky", "cyclic", "selfSlice"} {
+		if s, ok := context[key].(string); !ok || s == "" {
+			t.Errorf("context.%s = %#v, want a non-empty string", key, context[key])
+		}
+	}
+
+	if cycle, ok := context["cycle"].(map[string]interface{}); !ok {
+		t.Errorf("context.cycle = %#v, want an object", context["cycle"])
+	} else if s, ok := cycle["self"].(string); !ok || !strings.Contains(s, "cyclic") {
+		t.Errorf("context.cycle.self = %#v, want a cyclic marker", cycle["self"])
+	}
+
+	if group, ok := context["group"].(map[string]interface{}); !ok {
+		t.Errorf("context.group = %#v, want an object", context["group"])
+	} else {
+		if group["inner"] != "kept" {
+			t.Errorf("context.group.inner = %v, want kept", group["inner"])
+		}
+		if _, ok := group["bad"].(string); !ok {
+			t.Errorf("context.group.bad = %#v, want a string", group["bad"])
+		}
+	}
+
+	if extra["e"] != "x" {
+		t.Errorf("extra.e = %v, want x", extra["e"])
+	}
+	if _, ok := extra["bad"].(string); !ok {
+		t.Errorf("extra.bad = %#v, want a string", extra["bad"])
+	}
+}
+
+func TestJSONFormatterDegradesPerValue(t *testing.T) {
+	output, err := NewJSONFormatter().Format(badRecord())
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+
+	var parsed struct {
+		Message string                 `json:"message"`
+		Context map[string]interface{} `json:"context"`
+		Extra   map[string]interface{} `json:"extra"`
+	}
+	if err := json.Unmarshal(output, &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, output)
+	}
+	if parsed.Message != "bad values" {
+		t.Errorf("message = %q, want %q", parsed.Message, "bad values")
+	}
+	checkBadValues(t, parsed.Context, parsed.Extra)
+}
+
+func TestTextFormatterDegradesPerValue(t *testing.T) {
+	output, err := NewTextFormatter().Format(badRecord())
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+
+	line := strings.TrimSuffix(string(output), "\n")
+	_, rest, found := strings.Cut(line, ": bad values ")
+	if !found {
+		t.Fatalf("line lacks the message: %s", line)
+	}
+
+	// rest is "<context JSON> <extra JSON>"; decode both in sequence.
+	dec := json.NewDecoder(strings.NewReader(rest))
+	var context, extra map[string]interface{}
+	if err := dec.Decode(&context); err != nil {
+		t.Fatalf("context block is not JSON: %v\n%s", err, line)
+	}
+	if err := dec.Decode(&extra); err != nil {
+		t.Fatalf("extra block is not JSON: %v\n%s", err, line)
+	}
+	checkBadValues(t, context, extra)
+}
+
+func TestDescribeIsSafe(t *testing.T) {
+	deep := map[string]interface{}{}
+	m := deep
+	for i := 0; i < 100; i++ {
+		next := map[string]interface{}{}
+		m["next"] = next
+		m = next
+	}
+
+	shared := map[string]interface{}{"a": 1}
+	type node struct {
+		Name   string
+		Parent *node
+	}
+	parent := &node{Name: "parent"}
+	parent.Parent = parent
+
+	tests := []struct {
+		name  string
+		value interface{}
+		want  string // substring; "" = any non-empty string
+	}{
+		{"chan", make(chan int), ""},
+		{"panicky", panicky{}, "PANIC"},
+		{"self map", createCircularReference(), "cyclic"},
+		{"too deep", deep, "too deep"},
+		{"shared, not cyclic", []interface{}{shared, shared}, "map[a:1]"},
+		{"pointer cycle", parent, "parent"},
+		{"bytes", []byte("hi"), "[104 105]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := describe(tt.value)
+			if got == "" || !strings.Contains(got, tt.want) {
+				t.Errorf("describe = %q, want it to contain %q", got, tt.want)
+			}
+		})
+	}
 }

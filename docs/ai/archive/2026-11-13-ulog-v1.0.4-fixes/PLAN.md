@@ -9,9 +9,11 @@ impost on 2026-08-21. Line numbers below are for `main` at `bef41e3`
 
 ## Status (2026-11-13)
 
-Code done on branch `fix-rotation`: bugs 1–3 and the three read-through
-findings, with tests; `go test ./...` green. Not yet merged, tagged or pushed;
-impost side not started.
+DONE 2026-11-13: released as `v1.0.4` (branch `fix-rotation`, fast-forwarded
+into `main`). Bugs 1–3 and the three read-through findings fixed with tests,
+then eight Codex adversarial reviews, each confirmed finding fixed (see
+decisions below). The impost side (release steps 2–5) is done by the user
+in the impost repo, not tracked here.
 
 Decisions taken:
 

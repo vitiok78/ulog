@@ -1,6 +1,12 @@
 # MultiWriter and Handler do not serialize writes
 
-**Status:** OPEN (found 2026-11-13 while executing the v1.0.4 plan)
+**Status:** DONE 2026-11-13 — commit 17c557f (branch `fix-writer-race`):
+mutex in `MultiWriter` (Write, AddWriter), write mutex in `Handler` shared
+with `WithAttrs`/`WithGroup` copies. Also fixed in passing: siblings derived
+from one handler shared slice capacity and logged each other's attrs/groups.
+`go test -race ./...` passes in full.
+
+(found 2026-11-13 while executing the v1.0.4 plan)
 
 `go test -race ./...` fails on `TestMultiWriterConcurrentWrite`, on `main` too
 (not caused by v1.0.4). `MultiWriter.Write` (`writer.go`) has no lock, and

@@ -124,16 +124,51 @@ const (
 	// maxAttrExpansion bounds how many attributes one top-level attribute
 	// expands to.
 	maxAttrExpansion = 100_000
+	// maxAttrKeyBytes bounds the total length of the flattened keys one
+	// top-level attribute expands to. Keys repeat every group name above
+	// them, so long names in a cycle grow fast even under the other limits.
+	maxAttrKeyBytes = 16 << 20
+	// maxMarkerKeyBytes caps the key the limit marker is written under.
+	maxMarkerKeyBytes = 1024
 )
+
+// attrLimitMarker is written where an attribute's expansion was cut.
+var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes or %d key bytes per value]",
+	maxAttrExpansion, maxAttrKeyBytes)
 
 // attrBudget is what one top-level attribute may still expand. A LogValuer
 // can return a group that contains itself, or branches to itself twice;
 // Resolve stops only at the group, so without a budget expansion never ends.
 // Each top-level attribute gets its own, so one runaway value cannot crowd
 // out its siblings (a request ID logged after it, say).
-type attrBudget struct{ left int }
+type attrBudget struct {
+	left     int // attributes
+	keyBytes int // flattened key bytes
+}
 
-func newAttrBudget() *attrBudget { return &attrBudget{left: maxAttrExpansion} }
+func newAttrBudget() *attrBudget {
+	return &attrBudget{left: maxAttrExpansion, keyBytes: maxAttrKeyBytes}
+}
+
+// boundedKey joins groups and key with ".", stopping at limit bytes.
+func boundedKey(groups []string, key string, limit int) string {
+	var sb strings.Builder
+	add := func(s string) bool {
+		if room := limit - sb.Len(); len(s) > room {
+			sb.WriteString(s[:room])
+			return false
+		}
+		sb.WriteString(s)
+		return true
+	}
+	for _, g := range groups {
+		if !add(g) || !add(".") {
+			return sb.String()
+		}
+	}
+	add(key)
+	return sb.String()
+}
 
 // appendAttrBudget is appendAttr with the attribute's budget and its depth
 // inside groups.
@@ -145,15 +180,22 @@ func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, gro
 	}
 	b.left--
 
+	// Check the key's length before building it.
+	keyLen := len(attr.Key)
+	for _, g := range groups {
+		keyLen += len(g) + 1
+	}
+	if b.left == 0 || keyLen > b.keyBytes {
+		b.left = 0
+		m[boundedKey(groups, attr.Key, maxMarkerKeyBytes)] = attrLimitMarker
+		return false
+	}
+	b.keyBytes -= keyLen
+
 	// Apply groups to the key
 	key := attr.Key
 	if len(groups) > 0 {
 		key = strings.Join(groups, ".") + "." + key
-	}
-
-	if b.left == 0 {
-		m[key] = fmt.Sprintf("[attribute limit reached: %d per value]", maxAttrExpansion)
-		return false
 	}
 
 	// Resolve LogValuers first, as slog asks handlers to: a LogValuer may

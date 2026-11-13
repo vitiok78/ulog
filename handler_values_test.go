@@ -121,7 +121,7 @@ func TestHandlerBoundsSelfReferencingValuers(t *testing.T) {
 	}{
 		{"self", selfGroup{}, "[max group depth 64]"},
 		{"inline self", inlineSelfGroup{}, "[max group depth 64]"},
-		{"branching", branchingGroup{}, "[attribute limit reached: 100000 per value]"},
+		{"branching", branchingGroup{}, attrLimitMarker},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -198,6 +198,47 @@ func TestHandlerStopsAtExhaustedBudget(t *testing.T) {
 	}
 	if n := calls.Load(); n > maxAttrExpansion {
 		t.Errorf("LogValue called %d times, want at most the budget %d", n, maxAttrExpansion)
+	}
+	if ctx["ok"] != "kept" {
+		t.Errorf("ok = %#v, want kept", ctx["ok"])
+	}
+}
+
+// longKeyCycle references itself twice under 256-byte names: under the
+// depth and attribute limits, but the flattened keys alone grow to about
+// a gigabyte.
+type longKeyCycle struct{}
+
+var (
+	longKeyA = strings.Repeat("a", 256)
+	longKeyB = strings.Repeat("b", 256)
+)
+
+func (s longKeyCycle) LogValue() slog.Value {
+	return slog.GroupValue(slog.Any(longKeyA, s), slog.Any(longKeyB, s))
+}
+
+func TestHandlerBoundsKeyBytes(t *testing.T) {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	ctx := logOne(t, func(l *slog.Logger) { l.Info("m", "v", longKeyCycle{}, "ok", "kept") })
+	runtime.ReadMemStats(&after)
+
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 128<<20 {
+		t.Errorf("logging allocated %d MiB", allocated>>20)
+	}
+	found := false
+	for k, v := range ctx {
+		if v == attrLimitMarker {
+			found = true
+			if len(k) > maxMarkerKeyBytes {
+				t.Errorf("marker key is %d bytes, want at most %d", len(k), maxMarkerKeyBytes)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no limit marker among %d entries", len(ctx))
 	}
 	if ctx["ok"] != "kept" {
 		t.Errorf("ok = %#v, want kept", ctx["ok"])

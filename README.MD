@@ -233,8 +233,8 @@ nil receiver, or as `%!v(PANIC=String method: ...)`, like `fmt` does.
 `LogValue` is logged as slog's "LogValue panicked" error, and a `LogValuer`
 that returns a group is logged as that group. Groups nest at most 64 levels
 (deeper: `[max group depth 64]`), and one attribute expands to at most 100 000
-attributes and 16 MiB of flattened keys (then an `[attribute limit reached: ...]`
-marker at that key, cut to 1 KiB),
+attributes, 16 MiB of flattened keys and 16 MiB of values inside groups (then
+an `[attribute limit reached: ...]` marker at that key, cut to 1 KiB),
 so a `LogValuer` whose group contains itself cannot hang or crash the process.
 Each attribute has its own limit: a runaway value never drops the record's
 other attributes, the logger's, or the request context's.

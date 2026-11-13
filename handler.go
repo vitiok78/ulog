@@ -128,13 +128,17 @@ const (
 	// top-level attribute expands to. Keys repeat every group name above
 	// them, so long names in a cycle grow fast even under the other limits.
 	maxAttrKeyBytes = 16 << 20
+	// maxAttrPayloadBytes bounds the total size of the values an attribute
+	// expands to below the top level. Groups from LogValuers can repeat one
+	// shared value thousands of times.
+	maxAttrPayloadBytes = 16 << 20
 	// maxMarkerKeyBytes caps the key the limit marker is written under.
 	maxMarkerKeyBytes = 1024
 )
 
 // attrLimitMarker is written where an attribute's expansion was cut.
-var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes or %d key bytes per value]",
-	maxAttrExpansion, maxAttrKeyBytes)
+var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes, %d key bytes or %d value bytes per value]",
+	maxAttrExpansion, maxAttrKeyBytes, maxAttrPayloadBytes)
 
 // attrBudget is what one top-level attribute may still expand. A LogValuer
 // can return a group that contains itself, or branches to itself twice;
@@ -142,12 +146,33 @@ var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes or %d
 // Each top-level attribute gets its own, so one runaway value cannot crowd
 // out its siblings (a request ID logged after it, say).
 type attrBudget struct {
-	left     int // attributes
-	keyBytes int // flattened key bytes
+	left         int // attributes
+	keyBytes     int // flattened key bytes
+	payloadBytes int // value bytes below the top level
 }
 
 func newAttrBudget() *attrBudget {
-	return &attrBudget{left: maxAttrExpansion, keyBytes: maxAttrKeyBytes}
+	return &attrBudget{left: maxAttrExpansion, keyBytes: maxAttrKeyBytes, payloadBytes: maxAttrPayloadBytes}
+}
+
+// leafSize estimates the encoded size of an extracted value. Values that
+// are not plain strings or scalars are encoded to measure them; that cost
+// is bounded by the payload budget it is charged against.
+func leafSize(v interface{}) int {
+	switch x := v.(type) {
+	case nil:
+		return len("null")
+	case string:
+		return len(x) + 2
+	case bool, int64, uint64, float64:
+		return 24
+	case time.Time:
+		return 40
+	}
+	if data, err := marshalValue(v); err == nil {
+		return len(data)
+	}
+	return len(describe(v)) + 2
 }
 
 // boundedKey joins groups and key with ".", stopping at limit bytes.
@@ -227,7 +252,21 @@ func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, gro
 		}
 	default:
 		// For non-group values, extract the value properly
-		m[key] = h.extractValue(attr.Value)
+		val := h.extractValue(attr.Value)
+
+		// Below the top level, values may be one shared value repeated by
+		// expansion: charge them. A top-level value is the caller's own,
+		// written as is.
+		if depth > 0 {
+			size := leafSize(val)
+			if size > b.payloadBytes {
+				b.left = 0
+				m[key] = attrLimitMarker
+				return false
+			}
+			b.payloadBytes -= size
+		}
+		m[key] = val
 	}
 	return true
 }

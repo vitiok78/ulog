@@ -244,3 +244,42 @@ func TestHandlerBoundsKeyBytes(t *testing.T) {
 		t.Errorf("ok = %#v, want kept", ctx["ok"])
 	}
 }
+
+// sharedLeafTree branches into two children for level levels; every leaf
+// is the same 64 KiB string. 2^15 leaves: 2 GiB of values from 64 KiB.
+type sharedLeafTree struct{ level int }
+
+var sharedLeaf = strings.Repeat("x", 64<<10)
+
+func (s sharedLeafTree) LogValue() slog.Value {
+	if s.level == 0 {
+		return slog.StringValue(sharedLeaf)
+	}
+	return slog.GroupValue(slog.Any("l", sharedLeafTree{s.level - 1}), slog.Any("r", sharedLeafTree{s.level - 1}))
+}
+
+func TestHandlerBoundsSharedLeafPayload(t *testing.T) {
+	for name, f := range map[string]Formatter{"json": NewJSONFormatter(), "text": NewTextFormatter()} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			l := slog.New(NewHandler(Config{Formatter: f, Writer: &buf, Channel: "test", Level: slog.LevelInfo}))
+
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			l.Info("m", "v", sharedLeafTree{15}, "ok", "kept")
+			runtime.ReadMemStats(&after)
+
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<20 {
+				t.Errorf("logging allocated %d MiB", allocated>>20)
+			}
+			out := buf.String()
+			if !strings.Contains(out, attrLimitMarker) {
+				t.Errorf("no limit marker in %d bytes of output", len(out))
+			}
+			if !strings.Contains(out, `"ok":"kept"`) {
+				t.Error("ok attribute lost")
+			}
+		})
+	}
+}

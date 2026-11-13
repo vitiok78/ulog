@@ -86,3 +86,57 @@ func TestHandlerNestedGroupKeys(t *testing.T) {
 		t.Errorf("context = %v, want g.req.id=1 and g.req.inner.x=2", ctx)
 	}
 }
+
+// selfGroup returns a group holding itself: endless if expanded naively.
+type selfGroup struct{}
+
+func (s selfGroup) LogValue() slog.Value { return slog.GroupValue(slog.Any("next", s)) }
+
+// inlineSelfGroup does the same through a group with no key, which adds no
+// key prefix.
+type inlineSelfGroup struct{}
+
+func (s inlineSelfGroup) LogValue() slog.Value {
+	return slog.GroupValue(slog.Int("n", 1), slog.Any("", s))
+}
+
+// branchingGroup references itself twice: 2^depth attributes if expanded.
+type branchingGroup struct{}
+
+func (s branchingGroup) LogValue() slog.Value {
+	return slog.GroupValue(slog.Any("a", s), slog.Any("b", s))
+}
+
+// TestHandlerBoundsSelfReferencingValuers: values whose LogValue returns a
+// group containing themselves must finish, with a marker, and keep the
+// record's other attributes.
+func TestHandlerBoundsSelfReferencingValuers(t *testing.T) {
+	tests := []struct {
+		name   string
+		value  slog.LogValuer
+		marker string
+	}{
+		{"self", selfGroup{}, "[max group depth 64]"},
+		{"inline self", inlineSelfGroup{}, "[max group depth 64]"},
+		{"branching", branchingGroup{}, "[attribute limit reached: 100000 per record]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := logOne(t, func(l *slog.Logger) { l.Info("m", "ok", "kept", "v", tt.value) })
+
+			found := false
+			for _, v := range ctx {
+				if v == tt.marker {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("no %q among %d context entries", tt.marker, len(ctx))
+			}
+			if ctx["ok"] != "kept" {
+				t.Errorf("ok = %#v, want kept", ctx["ok"])
+			}
+		})
+	}
+}

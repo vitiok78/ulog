@@ -55,22 +55,25 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 	}
 
 	h.mu.RLock()
+	// One budget for the whole record, shared by all its attributes.
+	budget := newAttrBudget()
+
 	// Process attributes from the record
 	record.Attrs(func(attr slog.Attr) bool {
-		h.appendAttr(logRecord.Context, attr, h.groups)
+		h.appendAttrBudget(logRecord.Context, attr, h.groups, 0, budget)
 		return true
 	})
 
 	// Process pre-defined attributes
 	for _, attr := range h.attrs {
-		h.appendAttr(logRecord.Context, attr, h.groups)
+		h.appendAttrBudget(logRecord.Context, attr, h.groups, 0, budget)
 	}
 
 	// Extract attributes from context if available
 	if ctxAttrs := extractContextAttrs(ctx); len(ctxAttrs) > 0 {
 		ctxMap := make(map[string]interface{})
 		for _, attr := range ctxAttrs {
-			h.appendAttr(ctxMap, attr, nil)
+			h.appendAttrBudget(ctxMap, attr, nil, 0, budget)
 		}
 		logRecord.Context[h.config.CtxKeyName] = ctxMap
 	}
@@ -114,6 +117,34 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 
 // appendAttr adds an attribute to the log map
 func (h *Handler) appendAttr(m map[string]interface{}, attr slog.Attr, groups []string) {
+	h.appendAttrBudget(m, attr, groups, 0, newAttrBudget())
+}
+
+const (
+	// maxAttrDepth bounds group nesting within one attribute.
+	maxAttrDepth = 64
+	// maxAttrsPerRecord bounds how many attributes one record expands to.
+	maxAttrsPerRecord = 100_000
+)
+
+// attrBudget is what one record may still expand. A LogValuer can return a
+// group that contains itself, or branches to itself twice; Resolve stops
+// only at the group, so without a shared budget expansion never ends.
+type attrBudget struct{ left int }
+
+func newAttrBudget() *attrBudget { return &attrBudget{left: maxAttrsPerRecord} }
+
+// appendAttrBudget is appendAttr with the record's budget and the depth of
+// attr inside groups.
+func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, groups []string, depth int, b *attrBudget) {
+	b.left--
+	if b.left < 0 {
+		if b.left == -1 {
+			m["ulog.truncated"] = fmt.Sprintf("[attribute limit reached: %d per record]", maxAttrsPerRecord)
+		}
+		return
+	}
+
 	// Resolve LogValuers first, as slog asks handlers to: a LogValuer may
 	// resolve to a group. Resolve also turns a panicking LogValue into an
 	// error value and stops endless LogValue chains.
@@ -129,6 +160,11 @@ func (h *Handler) appendAttr(m map[string]interface{}, attr slog.Attr, groups []
 		key = strings.Join(groups, ".") + "." + key
 	}
 
+	if depth > maxAttrDepth {
+		m[key] = fmt.Sprintf("[max group depth %d]", maxAttrDepth)
+		return
+	}
+
 	switch attr.Value.Kind() {
 	case slog.KindGroup:
 		// For group values, recursively add each attribute in the group
@@ -137,12 +173,12 @@ func (h *Handler) appendAttr(m map[string]interface{}, attr slog.Attr, groups []
 		if attr.Key != "" {
 			subGroups := append(slices.Clip(groups), attr.Key)
 			for _, groupAttr := range groupAttrs {
-				h.appendAttr(m, groupAttr, subGroups)
+				h.appendAttrBudget(m, groupAttr, subGroups, depth+1, b)
 			}
 		} else {
 			// If the group has no key, add attributes at the current level
 			for _, groupAttr := range groupAttrs {
-				h.appendAttr(m, groupAttr, groups)
+				h.appendAttrBudget(m, groupAttr, groups, depth+1, b)
 			}
 		}
 	default:

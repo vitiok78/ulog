@@ -231,7 +231,10 @@ logged as their text; if `Error()` or `String()` panics (a typed nil such as
 nil receiver, or as `%!v(PANIC=String method: ...)`, like `fmt` does.
 `slog.LogValuer`s are resolved with `slog.Value.Resolve`, so a panicking
 `LogValue` is logged as slog's "LogValue panicked" error, and a `LogValuer`
-that returns a group is logged as that group.
+that returns a group is logged as that group. Groups nest at most 64 levels
+(deeper: `[max group depth 64]`), and one record expands to at most 100 000
+attributes (then `ulog.truncated` says so), so a `LogValuer` whose group
+contains itself cannot hang or crash the process.
 
 ### Values JSON cannot encode
 

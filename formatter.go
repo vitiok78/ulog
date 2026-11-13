@@ -218,8 +218,11 @@ func describe(v interface{}) (s string) {
 		return x.String()
 	}
 
-	budget := maxDescribeNodes
-	if !printable(reflect.ValueOf(v), 0, map[visit]bool{}, &budget) {
+	b := describeBudget{nodes: maxDescribeNodes, bytes: maxDescribeBytes}
+	if !printable(reflect.ValueOf(v), 0, map[visit]bool{}, &b) {
+		if b.bytes < 0 && b.nodes >= 0 {
+			return fmt.Sprintf("[%T too large to print: over %d bytes]", v, maxDescribeBytes)
+		}
 		return fmt.Sprintf("[cyclic, too deep or too large %T]", v)
 	}
 	return fmt.Sprintf("%+v", v)
@@ -232,7 +235,23 @@ const (
 	// that shares maps or slices a lot can be exponentially larger printed
 	// than in memory.
 	maxDescribeNodes = 100_000
+	// maxDescribeBytes bounds the estimated size of the printed value. A
+	// slice holding one long string many times is small in memory and huge
+	// printed.
+	maxDescribeBytes = 4 << 20
 )
+
+// describeBudget is what printable may still spend.
+type describeBudget struct {
+	nodes int
+	bytes int
+}
+
+// spend takes n bytes and reports whether the budget still holds.
+func (b *describeBudget) spend(n int) bool {
+	b.bytes -= n
+	return b.bytes >= 0
+}
 
 // visit identifies a map or slice on the current path of printable.
 type visit struct {
@@ -241,32 +260,33 @@ type visit struct {
 	typ reflect.Type
 }
 
-// printable reports whether fmt can print v in bounded time. It follows what
-// fmt follows: maps, slices, arrays, structs and interfaces at any depth, and
-// pointers only at the top level (deeper pointers print as addresses). It is
-// conservative: it ignores String and Error methods that would stop fmt early.
-func printable(v reflect.Value, depth int, path map[visit]bool, budget *int) bool {
-	*budget--
-	if depth > maxDescribeDepth || *budget < 0 {
+// printable reports whether fmt can print v in bounded time and space. It
+// follows what fmt follows: maps, slices, arrays, structs and interfaces at
+// any depth, and pointers only at the top level (deeper pointers print as
+// addresses), and estimates the printed size on the way. It is conservative:
+// it ignores String and Error methods that would stop fmt early.
+func printable(v reflect.Value, depth int, path map[visit]bool, b *describeBudget) bool {
+	b.nodes--
+	if depth > maxDescribeDepth || b.nodes < 0 {
 		return false
 	}
 
 	switch v.Kind() {
 	case reflect.Interface:
 		if v.IsNil() {
-			return true
+			return b.spend(len("<nil>"))
 		}
-		return printable(v.Elem(), depth+1, path, budget)
+		return printable(v.Elem(), depth+1, path, b)
 
 	case reflect.Pointer:
 		if depth > 0 || v.IsNil() {
-			return true
+			return b.spend(len("0xc000000000"))
 		}
-		return printable(v.Elem(), depth+1, path, budget)
+		return b.spend(1) && printable(v.Elem(), depth+1, path, b)
 
 	case reflect.Map:
 		if v.IsNil() {
-			return true
+			return b.spend(len("map[]"))
 		}
 		key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
 		if path[key] {
@@ -275,17 +295,23 @@ func printable(v reflect.Value, depth int, path map[visit]bool, budget *int) boo
 		path[key] = true
 		defer delete(path, key)
 
+		if !b.spend(len("map[]")) {
+			return false
+		}
 		iter := v.MapRange()
 		for iter.Next() {
-			if !printable(iter.Key(), depth+1, path, budget) || !printable(iter.Value(), depth+1, path, budget) {
+			if !b.spend(2) || !printable(iter.Key(), depth+1, path, b) || !printable(iter.Value(), depth+1, path, b) {
 				return false
 			}
 		}
 		return true
 
 	case reflect.Slice:
-		if v.IsNil() || !canNest(v.Type().Elem()) {
-			return true
+		if v.IsNil() {
+			return b.spend(len("[]"))
+		}
+		if !canNest(v.Type().Elem()) {
+			return scalarsFit(v, b)
 		}
 		key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
 		if path[key] {
@@ -293,34 +319,81 @@ func printable(v reflect.Value, depth int, path map[visit]bool, budget *int) boo
 		}
 		path[key] = true
 		defer delete(path, key)
-		return elementsPrintable(v, depth, path, budget)
+		return elementsPrintable(v, depth, path, b)
 
 	case reflect.Array:
 		if !canNest(v.Type().Elem()) {
-			return true
+			return scalarsFit(v, b)
 		}
-		return elementsPrintable(v, depth, path, budget)
+		return elementsPrintable(v, depth, path, b)
 
 	case reflect.Struct:
+		if !b.spend(len("{}")) {
+			return false
+		}
+		t := v.Type()
 		for i := 0; i < v.NumField(); i++ {
-			if !printable(v.Field(i), depth+1, path, budget) {
+			if !b.spend(len(t.Field(i).Name)+2) || !printable(v.Field(i), depth+1, path, b) {
 				return false
 			}
 		}
 		return true
+
+	case reflect.String:
+		return b.spend(v.Len() + 1)
 	}
 
-	return true
+	return b.spend(scalarSize(v.Kind()))
 }
 
 // elementsPrintable runs printable over the elements of a slice or array.
-func elementsPrintable(v reflect.Value, depth int, path map[visit]bool, budget *int) bool {
+func elementsPrintable(v reflect.Value, depth int, path map[visit]bool, b *describeBudget) bool {
+	if !b.spend(len("[]")) {
+		return false
+	}
 	for i := 0; i < v.Len(); i++ {
-		if !printable(v.Index(i), depth+1, path, budget) {
+		if !b.spend(1) || !printable(v.Index(i), depth+1, path, b) {
 			return false
 		}
 	}
 	return true
+}
+
+// scalarsFit spends the printed size of a slice or array of scalars. Strings
+// are summed one by one (they may all share one long string); other elements
+// are estimated from the count, without looking at each.
+func scalarsFit(v reflect.Value, b *describeBudget) bool {
+	if !b.spend(len("[]")) {
+		return false
+	}
+	if v.Type().Elem().Kind() != reflect.String {
+		n := v.Len()
+		size := scalarSize(v.Type().Elem().Kind()) + 1
+		if n > b.bytes/size {
+			b.bytes = -1
+			return false
+		}
+		return b.spend(n * size)
+	}
+	for i := 0; i < v.Len(); i++ {
+		if !b.spend(v.Index(i).Len() + 1) {
+			return false
+		}
+	}
+	return true
+}
+
+// scalarSize is the most fmt prints for one scalar of kind k, roughly.
+func scalarSize(k reflect.Kind) int {
+	switch k {
+	case reflect.Bool:
+		return len("false")
+	case reflect.Int8, reflect.Uint8:
+		return len("-128")
+	case reflect.Complex64, reflect.Complex128:
+		return 2*len("-1.7976931348623157e+308") + 3
+	}
+	return len("-1.7976931348623157e+308")
 }
 
 // canNest reports whether values of type t can contain other values that

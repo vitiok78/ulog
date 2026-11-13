@@ -228,8 +228,8 @@ cannot be opened, the next write opens it again. `Write` after `Close` returns
 Both formatters encode context and extra values one by one. A value JSON
 rejects (a channel, a func, `NaN`, a struct holding one) is written as a string
 and the rest of the record is kept: its `String()`/`Error()` text if it has
-one, otherwise its `fmt` `%+v` dump. A value that refers to itself, or is too
-deep or large to print, is written as its type name only. A nested map that
+one, otherwise its `fmt` `%+v` dump. A value that refers to itself, is too
+deep, or would print to more than 4 MiB is written as its type name only. A nested map that
 appears several times in one record is written in full each time, up to 4 MiB
 of repeats; further copies are replaced by a marker.
 

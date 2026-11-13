@@ -715,3 +715,47 @@ func TestSharedMapWrittenInFull(t *testing.T) {
 		}
 	}
 }
+
+// TestDumpOfSharedStringsStaysBounded: 16 384 references to one 64 KiB
+// string next to a channel. Small in memory, over 1 GiB printed with %+v.
+func TestDumpOfSharedStringsStaysBounded(t *testing.T) {
+	long := strings.Repeat("s", 64<<10)
+	values := make([]string, 16<<10)
+	for i := range values {
+		values[i] = long
+	}
+	type payload struct {
+		Ch     chan int
+		Values []string
+		Bytes  []byte
+	}
+	record := LogRecord{Message: "big", Context: map[string]interface{}{
+		"big":   payload{Ch: make(chan int), Values: values},
+		"bytes": payload{Ch: make(chan int), Bytes: make([]byte, 8<<20)},
+		"small": payload{Ch: make(chan int), Values: []string{"a", "b"}},
+	}}
+
+	for name, f := range map[string]Formatter{"json": NewJSONFormatter(), "text": NewTextFormatter()} {
+		t.Run(name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			output, err := f.Format(record)
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatalf("Format: %v", err)
+			}
+
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+				t.Errorf("Format allocated %d MiB", allocated>>20)
+			}
+			out := string(output)
+			if got := strings.Count(out, "too large to print"); got != 2 {
+				t.Errorf("%d too-large markers, want 2 (big, bytes): %.300s", got, out)
+			}
+			if !strings.Contains(out, "Values:[a b]") {
+				t.Errorf("small value not dumped: %.300s", out)
+			}
+		})
+	}
+}

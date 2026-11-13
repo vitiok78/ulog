@@ -223,6 +223,16 @@ keep going to the active file and rotation is retried later; if the new file
 cannot be opened, the next write opens it again. `Write` after `Close` returns
 `os.ErrClosed`.
 
+### Values whose methods panic
+
+A log call never panics because of a value. Errors and `fmt.Stringer`s are
+logged as their text; if `Error()` or `String()` panics (a typed nil such as
+`(*os.PathError)(nil)` is the usual case), the value is logged as `<nil>` for a
+nil receiver, or as `%!v(PANIC=String method: ...)`, like `fmt` does.
+`slog.LogValuer`s are resolved with `slog.Value.Resolve`, so a panicking
+`LogValue` is logged as slog's "LogValue panicked" error, and a `LogValuer`
+that returns a group is logged as that group.
+
 ### Values JSON cannot encode
 
 Both formatters encode context and extra values one by one. A value JSON

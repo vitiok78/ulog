@@ -114,6 +114,11 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 
 // appendAttr adds an attribute to the log map
 func (h *Handler) appendAttr(m map[string]interface{}, attr slog.Attr, groups []string) {
+	// Resolve LogValuers first, as slog asks handlers to: a LogValuer may
+	// resolve to a group. Resolve also turns a panicking LogValue into an
+	// error value and stops endless LogValue chains.
+	attr.Value = attr.Value.Resolve()
+
 	if attr.Equal(slog.Attr{}) {
 		return
 	}
@@ -129,8 +134,8 @@ func (h *Handler) appendAttr(m map[string]interface{}, attr slog.Attr, groups []
 		// For group values, recursively add each attribute in the group
 		groupAttrs := attr.Value.Group()
 		// If the group key is not empty, create a new level of nesting
-		if key != "" {
-			subGroups := append(append([]string{}, groups...), key)
+		if attr.Key != "" {
+			subGroups := append(slices.Clip(groups), attr.Key)
 			for _, groupAttr := range groupAttrs {
 				h.appendAttr(m, groupAttr, subGroups)
 			}
@@ -153,19 +158,20 @@ func (h *Handler) extractValue(v slog.Value) interface{} {
 		// Handle special types
 		anyVal := v.Any()
 
-		// Handle errors
+		// Errors and Stringers become their text. The method may panic (a
+		// typed nil such as (*os.PathError)(nil) is the usual case); a log
+		// call must not, so fall back to describe, which prints what fmt
+		// would ("<nil>" for a nil receiver, else a PANIC note).
 		if err, ok := anyVal.(error); ok {
-			return err.Error()
+			return methodText(anyVal, err.Error)
 		}
-
-		// Handle fmt.Stringer
 		if stringer, ok := anyVal.(fmt.Stringer); ok {
-			return stringer.String()
+			return methodText(anyVal, stringer.String)
 		}
 
 		return anyVal
 	case slog.KindLogValuer:
-		return h.extractValue(v.LogValuer().LogValue())
+		return h.extractValue(v.Resolve())
 	case slog.KindDuration:
 		// Handle duration values by converting to string
 		return v.Duration().String()
@@ -184,6 +190,16 @@ func (h *Handler) extractValue(v slog.Value) interface{} {
 	default:
 		return v.Any()
 	}
+}
+
+// methodText returns text(), or describe(v) if text panics.
+func methodText(v interface{}, text func() string) (s string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s = describe(v)
+		}
+	}()
+	return text()
 }
 
 // MultiHandler sends log entries to multiple handlers

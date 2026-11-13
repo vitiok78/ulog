@@ -49,7 +49,13 @@ Decisions taken:
   the dump goes through our own printer (`dumper`): output identical to
   `%+v` for ordinary values (`TestDumpMatchesFmt`), `[cycle]` where fmt
   loops, `[max depth]` past 256 levels, and a hard 4 MiB cap that keeps the
-  beginning and appends `...[truncated at 4194304 bytes]`. Nested `map[string]interface{}` values
+  beginning and appends `...[truncated at 4194304 bytes]`. Seventh review:
+  the printer still let fmt run Error/String (fmt formats a panic value with
+  no limits: a self-containing panic value overflowed the stack, fatal), and
+  re-looked-up map values by key (NaN keys lost their value). Now methods
+  are called directly, `Format` gets a capped `fmt.State`, a panic becomes
+  `%!v(PANIC=<kind> method: <string payload or its type>)`, and map entries
+  come from `MapRange`. Nested `map[string]interface{}` values
   (the ctx group) degrade per entry, with a cycle marker. They are rebuilt
   as a safe tree and marshalled once (third Codex review: re-encoding each
   level as `RawMessage` copied a deep subtree once per level). A map

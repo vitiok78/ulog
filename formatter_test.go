@@ -632,12 +632,70 @@ func TestDumpMatchesFmt(t *testing.T) {
 		map[bool]string{true: "t", false: "f"},
 		[3]byte{1, 2, 3},
 		complex64(3 - 4i),
+		map[float64]string{math.NaN(): "important", 1: "b"},
+		panicky{},
+		[]interface{}{panicky{}, (*nilPanicker)(nil), flagFormatter{}},
+		flagFormatter{},
 	}
 	for i, v := range values {
 		want := fmt.Sprintf("%+v", v)
 		if got := dump(v); got != want {
 			t.Errorf("value %d:\n dump = %s\n fmt  = %s", i, got, want)
 		}
+	}
+}
+
+// nilPanicker's String panics on a nil receiver; fmt prints "<nil>" then.
+type nilPanicker struct{ s string }
+
+func (p *nilPanicker) String() string { return p.s }
+
+// flagFormatter shows the verb and the '+' flag it was given.
+type flagFormatter struct{}
+
+func (flagFormatter) Format(s fmt.State, verb rune) {
+	fmt.Fprintf(s, "F[%c %v]", verb, s.Flag('+'))
+}
+
+// cyclicPanicker panics with a value that contains itself. fmt formats a
+// panic value with no cycle check and overflows the stack, which no recover
+// can stop, so this test crashes the test binary if the fallback uses fmt.
+type cyclicPanicker struct{}
+
+func (cyclicPanicker) String() string {
+	m := map[string]interface{}{}
+	m["self"] = m
+	panic(m)
+}
+
+// floodFormatter writes 100 MiB through fmt.State, recovering any panic
+// from the writes as some Format methods do.
+type floodFormatter struct{}
+
+func (floodFormatter) Format(s fmt.State, _ rune) {
+	defer func() { recover() }()
+	chunk := []byte(strings.Repeat("f", 1<<20))
+	for i := 0; i < 100; i++ {
+		s.Write(chunk)
+	}
+}
+
+func TestDumpMethodsAreBounded(t *testing.T) {
+	got := describe([]interface{}{make(chan int), cyclicPanicker{}})
+	if want := "%!v(PANIC=String method: map[string]interface {})"; !strings.Contains(got, want) {
+		t.Errorf("describe = %q, want it to contain %q", got, want)
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	got = describe(floodFormatter{})
+	runtime.ReadMemStats(&after)
+	if !strings.HasSuffix(got, "...[truncated at 4194304 bytes]") {
+		t.Errorf("Format output not truncated: %d bytes, ends %q", len(got), got[max(0, len(got)-40):])
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Errorf("describe allocated %d MiB", allocated>>20)
 	}
 }
 

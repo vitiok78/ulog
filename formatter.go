@@ -234,6 +234,7 @@ type dumpFull struct{}
 type dumper struct {
 	buf   []byte
 	limit int
+	full  bool           // a method's output reached the limit
 	path  map[visit]bool // maps and slices on the current path
 }
 
@@ -280,10 +281,15 @@ func (d *dumper) value(v reflect.Value, depth int) {
 		return
 	}
 
+	if v.Kind() == reflect.Interface && v.IsNil() {
+		d.write("<nil>")
+		return
+	}
+
 	// fmt prints a value through its Format, Error or String method when
 	// it can reach the value (exported fields only).
 	if v.CanInterface() && hasPrintMethod(v.Type()) {
-		d.write(methodOutput(v.Interface()))
+		d.method(v.Interface())
 		return
 	}
 
@@ -376,10 +382,16 @@ func (d *dumper) mapValue(v reflect.Value, depth int) {
 			entry(i, iter.Key(), iter.Value())
 		}
 	} else {
-		keys := v.MapKeys()
-		slices.SortStableFunc(keys, compareKeys)
-		for i, k := range keys {
-			entry(i, k, v.MapIndex(k))
+		// Take keys and values together: looking a value up again by its
+		// key fails for keys that are not equal to themselves (NaN).
+		type pair struct{ k, v reflect.Value }
+		pairs := make([]pair, 0, v.Len())
+		for iter := v.MapRange(); iter.Next(); {
+			pairs = append(pairs, pair{iter.Key(), iter.Value()})
+		}
+		slices.SortStableFunc(pairs, func(a, b pair) int { return compareKeys(a.k, b.k) })
+		for i, p := range pairs {
+			entry(i, p.k, p.v)
 		}
 	}
 	d.write("]")
@@ -481,13 +493,117 @@ func hasPrintMethod(t reflect.Type) bool {
 	return t.Implements(formatterType) || t.Implements(errorType) || t.Implements(stringerType)
 }
 
-// methodOutput is what %+v prints for x through its method. fmt itself turns
-// a panic in the method into a %!v(PANIC=...) note.
-func methodOutput(x interface{}) (s string) {
+// method prints x through its Format, Error or String method, as fmt's
+// handleMethods does for %+v, but without fmt: fmt formats a panic value
+// with no limits (a panic value that contains itself overflows the stack),
+// and Format would write into an unbounded buffer. Here Format writes into
+// the capped buffer, and a panic becomes a fixed note.
+func (d *dumper) method(x interface{}) {
+	// fmt prints "<nil>" when the receiver is a nil pointer and the method
+	// panics; do the same without calling it.
+	if rv := reflect.ValueOf(x); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		if !safeCall(func() { d.callMethod(x) }) {
+			d.write("<nil>")
+		}
+		d.stopIfFull()
+		return
+	}
+
+	kind := "String"
+	switch x.(type) {
+	case fmt.Formatter:
+		kind = "Format"
+	case error:
+		kind = "Error"
+	}
+
+	var payload interface{}
+	if !safeCallPayload(func() { d.callMethod(x) }, &payload) {
+		note := "%!v(PANIC=" + kind + " method"
+		if s, isString := payload.(string); isString {
+			note += ": " + s
+		} else {
+			note += fmt.Sprintf(": %T", payload)
+		}
+		d.write(note + ")")
+	}
+	d.stopIfFull()
+}
+
+// callMethod runs the print method of x, writing its output.
+func (d *dumper) callMethod(x interface{}) {
+	switch m := x.(type) {
+	case fmt.Formatter:
+		m.Format(dumpState{d}, 'v')
+	case error:
+		d.writeQuiet(m.Error())
+	case fmt.Stringer:
+		d.writeQuiet(m.String())
+	}
+}
+
+// writeQuiet appends what fits of s without unwinding, so it is safe to call
+// from user code that might recover panics. stopIfFull unwinds afterwards.
+func (d *dumper) writeQuiet(s string) {
+	if d.full {
+		return
+	}
+	if room := d.limit - len(d.buf); len(s) > room {
+		d.buf = append(d.buf, s[:room]...)
+		d.full = true
+		return
+	}
+	d.buf = append(d.buf, s...)
+}
+
+// writeQuietBytes is writeQuiet for a byte slice, without copying it to a
+// string first.
+func (d *dumper) writeQuietBytes(b []byte) {
+	if d.full {
+		return
+	}
+	if room := d.limit - len(d.buf); len(b) > room {
+		d.buf = append(d.buf, b[:room]...)
+		d.full = true
+		return
+	}
+	d.buf = append(d.buf, b...)
+}
+
+// stopIfFull unwinds the dump once a method has filled the buffer.
+func (d *dumper) stopIfFull() {
+	if d.full {
+		panic(dumpFull{})
+	}
+}
+
+// dumpState is the fmt.State a Format method writes to, as for %+v.
+type dumpState struct{ d *dumper }
+
+func (s dumpState) Write(b []byte) (int, error) {
+	s.d.writeQuietBytes(b)
+	return len(b), nil
+}
+
+func (s dumpState) Width() (int, bool)     { return 0, false }
+func (s dumpState) Precision() (int, bool) { return 0, false }
+func (s dumpState) Flag(c int) bool        { return c == '+' }
+
+// safeCall runs f and reports whether it returned without panicking.
+func safeCall(f func()) bool {
+	var payload interface{}
+	return safeCallPayload(f, &payload)
+}
+
+// safeCallPayload runs f; on a panic it stores the panic value in payload
+// and returns false. The value is not formatted here.
+func safeCallPayload(f func(), payload *interface{}) (ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			s = "%!v(PANIC)"
+			*payload = r
+			ok = false
 		}
 	}()
-	return fmt.Sprintf("%+v", x)
+	f()
+	return true
 }

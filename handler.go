@@ -115,7 +115,7 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 
 // appendAttr adds an attribute to the log map
 func (h *Handler) appendAttr(m map[string]interface{}, attr slog.Attr, groups []string) {
-	h.appendAttrBudget(m, attr, groups, 0, newAttrBudget())
+	_ = h.appendAttrBudget(m, attr, groups, 0, newAttrBudget())
 }
 
 const (
@@ -137,19 +137,23 @@ func newAttrBudget() *attrBudget { return &attrBudget{left: maxAttrExpansion} }
 
 // appendAttrBudget is appendAttr with the attribute's budget and its depth
 // inside groups.
-func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, groups []string, depth int, b *attrBudget) {
+func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, groups []string, depth int, b *attrBudget) bool {
+	// Exhausted: the marker is already written. Return before any work, and
+	// tell the caller to stop visiting the remaining siblings.
+	if b.left <= 0 {
+		return false
+	}
+	b.left--
+
 	// Apply groups to the key
 	key := attr.Key
 	if len(groups) > 0 {
 		key = strings.Join(groups, ".") + "." + key
 	}
 
-	b.left--
-	if b.left < 0 {
-		if b.left == -1 {
-			m[key] = fmt.Sprintf("[attribute limit reached: %d per value]", maxAttrExpansion)
-		}
-		return
+	if b.left == 0 {
+		m[key] = fmt.Sprintf("[attribute limit reached: %d per value]", maxAttrExpansion)
+		return false
 	}
 
 	// Resolve LogValuers first, as slog asks handlers to: a LogValuer may
@@ -158,34 +162,32 @@ func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, gro
 	attr.Value = attr.Value.Resolve()
 
 	if attr.Equal(slog.Attr{}) {
-		return
+		return true
 	}
 
 	if depth > maxAttrDepth {
 		m[key] = fmt.Sprintf("[max group depth %d]", maxAttrDepth)
-		return
+		return true
 	}
 
 	switch attr.Value.Kind() {
 	case slog.KindGroup:
-		// For group values, recursively add each attribute in the group
-		groupAttrs := attr.Value.Group()
-		// If the group key is not empty, create a new level of nesting
+		// For group values, recursively add each attribute in the group.
+		// A key-less group adds its attributes at the current level.
+		subGroups := groups
 		if attr.Key != "" {
-			subGroups := append(slices.Clip(groups), attr.Key)
-			for _, groupAttr := range groupAttrs {
-				h.appendAttrBudget(m, groupAttr, subGroups, depth+1, b)
-			}
-		} else {
-			// If the group has no key, add attributes at the current level
-			for _, groupAttr := range groupAttrs {
-				h.appendAttrBudget(m, groupAttr, groups, depth+1, b)
+			subGroups = append(slices.Clip(groups), attr.Key)
+		}
+		for _, groupAttr := range attr.Value.Group() {
+			if !h.appendAttrBudget(m, groupAttr, subGroups, depth+1, b) {
+				return false
 			}
 		}
 	default:
 		// For non-group values, extract the value properly
 		m[key] = h.extractValue(attr.Value)
 	}
+	return true
 }
 
 // extractValue properly extracts values from slog.Value, handling errors and stringers

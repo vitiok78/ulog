@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -159,5 +161,45 @@ func TestHandlerBoundsSelfReferencingValuers(t *testing.T) {
 				t.Errorf("ctx = %#v, want request_id req-1", got["ctx"])
 			}
 		})
+	}
+}
+
+// wideSelf returns one prebuilt group of 100 000 references to itself.
+type wideSelf struct{ calls *atomic.Int64 }
+
+var wideSelfGroup slog.Value
+
+func (s wideSelf) LogValue() slog.Value {
+	s.calls.Add(1)
+	return wideSelfGroup
+}
+
+// TestHandlerStopsAtExhaustedBudget: once an attribute's budget is spent,
+// the remaining siblings at every level are not visited.
+func TestHandlerStopsAtExhaustedBudget(t *testing.T) {
+	calls := &atomic.Int64{}
+	self := wideSelf{calls: calls}
+	attrs := make([]slog.Attr, 100_000)
+	for i := range attrs {
+		attrs[i] = slog.Any("x", self)
+	}
+	wideSelfGroup = slog.GroupValue(attrs...)
+	t.Cleanup(func() { wideSelfGroup = slog.Value{} })
+
+	// Visits after exhaustion each built a key: millions of strings.
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	ctx := logOne(t, func(l *slog.Logger) { l.Info("m", "v", self, "ok", "kept") })
+	runtime.ReadMemStats(&after)
+
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Errorf("logging allocated %d MiB", allocated>>20)
+	}
+	if n := calls.Load(); n > maxAttrExpansion {
+		t.Errorf("LogValue called %d times, want at most the budget %d", n, maxAttrExpansion)
+	}
+	if ctx["ok"] != "kept" {
+		t.Errorf("ok = %#v, want kept", ctx["ok"])
 	}
 }

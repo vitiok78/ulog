@@ -870,6 +870,53 @@ func TestSharedMapWrittenInFull(t *testing.T) {
 	}
 }
 
+// TestFormatterValueCap: past the per-section cap, large values become a
+// marker without being encoded, small ones are still written, and a single
+// value larger than the cap is written in full.
+func TestFormatterValueCap(t *testing.T) {
+	big := strings.Repeat("b", 1<<20)
+	ctx := map[string]interface{}{"huge": strings.Repeat("h", maxFieldsValueBytes+1)}
+	for i := 0; i < 100; i++ {
+		ctx[fmt.Sprintf("big%03d", i)] = big
+	}
+	ctx["id"] = "req-1"
+	ctx["n"] = 42
+	ctx["when"] = time.Unix(0, 0).UTC()
+
+	output, err := NewJSONFormatter().Format(LogRecord{Message: "cap", Context: ctx})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	var parsed struct {
+		Context map[string]interface{} `json:"context"`
+	}
+	if err := json.Unmarshal(output, &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	if parsed.Context["id"] != "req-1" || parsed.Context["n"] != float64(42) || parsed.Context["when"] != "1970-01-01T00:00:00Z" {
+		t.Errorf("small values lost: id=%v n=%v when=%v", parsed.Context["id"], parsed.Context["n"], parsed.Context["when"])
+	}
+	written, omitted := 0, 0
+	for k, v := range parsed.Context {
+		switch {
+		case v == valueLimitMarker:
+			omitted++
+		case k == "huge" || strings.HasPrefix(k, "big"):
+			written++
+		}
+	}
+	// The map is unordered: "huge" alone exhausts the cap if it comes
+	// first; otherwise up to 16 big values fit before it. Either way most
+	// values are omitted and none is cut in half.
+	if omitted < 80 || written+omitted != 101 {
+		t.Errorf("written=%d omitted=%d, want most of 101 large values omitted", written, omitted)
+	}
+	if len(output) > 2*maxFieldsValueBytes+(4<<20) {
+		t.Errorf("output is %d MiB", len(output)>>20)
+	}
+}
+
 // TestDumpOfSharedStringsStaysBounded: 16 384 references to one 64 KiB
 // string next to a channel. Small in memory, over 1 GiB printed with %+v.
 func TestDumpOfSharedStringsStaysBounded(t *testing.T) {

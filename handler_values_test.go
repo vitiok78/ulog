@@ -275,8 +275,8 @@ func TestHandlerBoundsSharedLeafPayload(t *testing.T) {
 				t.Errorf("logging allocated %d MiB", allocated>>20)
 			}
 			out := buf.String()
-			if !strings.Contains(out, attrLimitMarker) {
-				t.Errorf("no limit marker in %d bytes of output", len(out))
+			if !strings.Contains(out, valueLimitMarker) {
+				t.Errorf("no value limit marker in %d bytes of output", len(out))
 			}
 			if !strings.Contains(out, `"ok":"kept"`) {
 				t.Error("ok attribute lost")
@@ -298,9 +298,9 @@ func (s badTimeTree) LogValue() slog.Value {
 	return slog.GroupValue(slog.Any("l", badTimeTree{s.level - 1}), slog.Any("r", badTimeTree{s.level - 1}))
 }
 
-// TestHandlerMeasuresLeavesLikeFormatters: payload measurement must not
-// undercount (invalid times) or expand what the formatter bounds (shared
-// maps).
+// TestHandlerMeasuresLeavesLikeFormatters: repeated leaves whose written
+// form is large (invalid times with long zone names) and shared map DAGs
+// inside groups stay bounded, and the record's other attributes survive.
 func TestHandlerMeasuresLeavesLikeFormatters(t *testing.T) {
 	// 30 maps, each referencing the one below twice: 2^30 entries if
 	// encoded naively.
@@ -325,8 +325,8 @@ func TestHandlerMeasuresLeavesLikeFormatters(t *testing.T) {
 				logIt(l)
 				runtime.ReadMemStats(&after)
 
-				// Bounded by the 16 MiB payload budget times the per-leaf
-				// work (measure, then format); unbounded it is gigabytes.
+				// Bounded by the formatter's 16 MiB value cap times the
+				// copies made on the way out; unbounded it is gigabytes.
 				if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 512<<20 {
 					t.Errorf("logging allocated %d MiB", allocated>>20)
 				}
@@ -335,5 +335,44 @@ func TestHandlerMeasuresLeavesLikeFormatters(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// freshStringer builds a new 64 KiB string on every String call.
+type freshStringer struct{}
+
+func (freshStringer) String() string { return strings.Repeat("s", 64<<10) }
+
+// stringerTree repeats one freshStringer at 2^level leaves.
+type stringerTree struct{ level int }
+
+func (s stringerTree) LogValue() slog.Value {
+	if s.level == 0 {
+		return slog.AnyValue(freshStringer{})
+	}
+	return slog.GroupValue(slog.Any("l", stringerTree{s.level - 1}), slog.Any("r", stringerTree{s.level - 1}))
+}
+
+// TestHandlerBoundsMethodText: String() runs in the handler, once per
+// occurrence; a tree repeating one Stringer must stop calling it.
+func TestHandlerBoundsMethodText(t *testing.T) {
+	var buf bytes.Buffer
+	l := slog.New(NewHandler(Config{Formatter: NewJSONFormatter(), Writer: &buf, Channel: "test", Level: slog.LevelInfo}))
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	l.Info("m", "v", stringerTree{15}, "ok", "kept")
+	runtime.ReadMemStats(&after)
+
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<20 {
+		t.Errorf("logging allocated %d MiB", allocated>>20)
+	}
+	out := buf.String()
+	if !strings.Contains(out, attrLimitMarker) {
+		t.Errorf("no attribute limit marker in %d bytes of output", len(out))
+	}
+	if !strings.Contains(out, `"ok":"kept"`) {
+		t.Error("ok attribute lost")
 	}
 }

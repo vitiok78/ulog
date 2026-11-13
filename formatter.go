@@ -83,24 +83,25 @@ func (f *TextFormatter) Format(record LogRecord) ([]byte, error) {
 		record.LevelName,
 		record.Message)
 
-	logLine += " " + textFields(record.Context)
-	logLine += " " + textFields(record.Extra)
-
-	// Add newline
-	return []byte(logLine + "\n"), nil
+	// Build the line in one buffer: context and extra can be megabytes, and
+	// joining strings would copy them several times.
+	line := []byte(logLine)
+	line = appendTextFields(append(line, ' '), record.Context)
+	line = appendTextFields(append(line, ' '), record.Extra)
+	return append(line, '\n'), nil
 }
 
 // textFields renders m for TextFormatter: "[]" when empty, JSON otherwise.
-func textFields(m map[string]interface{}) string {
+func appendTextFields(dst []byte, m map[string]interface{}) []byte {
 	if len(m) == 0 {
-		return "[]"
+		return append(dst, "[]"...)
 	}
 	data, err := json.Marshal(encodeFields(m))
 	if err != nil {
 		// Not reachable: every entry is already valid JSON.
-		return "[]"
+		return append(dst, "[]"...)
 	}
-	return string(data)
+	return append(dst, data...)
 }
 
 // encodeFields returns m with every value made safe for json.Marshal, so a
@@ -115,7 +116,7 @@ func encodeFields(m map[string]interface{}) map[string]interface{} {
 	if m == nil {
 		return nil
 	}
-	s := &safeState{path: map[uintptr]bool{}, done: map[uintptr]safeResult{}}
+	s := &safeState{path: map[uintptr]bool{}, done: map[uintptr]safeResult{}, valueBytes: maxFieldsValueBytes}
 	out, _ := s.safeMap(m)
 	return out
 }
@@ -128,9 +129,53 @@ const maxRepeatedBytes = 4 << 20
 
 // safeState carries one encodeFields call.
 type safeState struct {
-	path     map[uintptr]bool       // maps on the current path, for cycles
-	done     map[uintptr]safeResult // maps already rebuilt
-	repeated int                    // approximate bytes spent on repeats
+	path       map[uintptr]bool       // maps on the current path, for cycles
+	done       map[uintptr]safeResult // maps already rebuilt
+	repeated   int                    // approximate bytes spent on repeats
+	valueBytes int                    // encoded value bytes still allowed
+}
+
+const (
+	// maxFieldsValueBytes caps the encoded values of one record section
+	// (context or extra), counted from the bytes actually produced. A value
+	// that starts while budget is left is written in full, so a single
+	// large value is never cut. Past the cap, only small values are written
+	// (see smallValue); others become valueLimitMarker without being
+	// encoded. The handler can expand one compact value into thousands of
+	// leaves that all repeat one shared payload; this is what bounds them.
+	maxFieldsValueBytes = 16 << 20
+	// maxSmallStringBytes: strings up to this length still count as small.
+	maxSmallStringBytes = 1024
+)
+
+// valueLimitMarker replaces values past maxFieldsValueBytes.
+var valueLimitMarker = fmt.Sprintf("[value omitted: %d bytes of values already written in this record]", maxFieldsValueBytes)
+
+// smallValue encodes v if it is cheap to encode and small: nil, a bool, a
+// number, a short string or a time that encodes. These are still written
+// past the cap, so IDs, counts and timestamps logged next to a runaway
+// value survive.
+func smallValue(v interface{}) (json.RawMessage, bool) {
+	switch x := v.(type) {
+	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+	case string:
+		if len(x) > maxSmallStringBytes {
+			return nil, false
+		}
+	case time.Time:
+		data, err := x.MarshalJSON()
+		if err != nil {
+			return nil, false
+		}
+		return data, true
+	default:
+		return nil, false
+	}
+	data, err := marshalValue(v)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
 }
 
 // safeResult is a rebuilt map and the approximate size of its JSON.
@@ -179,10 +224,20 @@ func (s *safeState) safeValue(v interface{}) (interface{}, int) {
 		return s.safeMap(nested)
 	}
 
+	// Past the cap: small values only, the rest is not encoded at all.
+	if s.valueBytes <= 0 {
+		if data, ok := smallValue(v); ok {
+			return data, len(data)
+		}
+		return valueLimitMarker, len(valueLimitMarker) + 2
+	}
+
 	if data, err := marshalValue(v); err == nil {
+		s.valueBytes -= len(data)
 		return json.RawMessage(data), len(data)
 	}
 	desc := describe(v)
+	s.valueBytes -= len(desc)
 	return desc, len(desc) + 2
 }
 

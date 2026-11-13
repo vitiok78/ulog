@@ -2,7 +2,6 @@ package ulog
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -129,17 +128,19 @@ const (
 	// top-level attribute expands to. Keys repeat every group name above
 	// them, so long names in a cycle grow fast even under the other limits.
 	maxAttrKeyBytes = 16 << 20
-	// maxAttrPayloadBytes bounds the total size of the values an attribute
-	// expands to below the top level. Groups from LogValuers can repeat one
-	// shared value thousands of times.
-	maxAttrPayloadBytes = 16 << 20
+	// maxAttrMethodBytes bounds the Error() and String() text one top-level
+	// attribute's values produce. That text is built per occurrence, so a
+	// group tree repeating one Stringer builds it thousands of times. (The
+	// size of all other values is bounded where they are written, in the
+	// formatter.)
+	maxAttrMethodBytes = 16 << 20
 	// maxMarkerKeyBytes caps the key the limit marker is written under.
 	maxMarkerKeyBytes = 1024
 )
 
 // attrLimitMarker is written where an attribute's expansion was cut.
-var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes, %d key bytes or %d value bytes per value]",
-	maxAttrExpansion, maxAttrKeyBytes, maxAttrPayloadBytes)
+var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes, %d key bytes or %d method-text bytes per value]",
+	maxAttrExpansion, maxAttrKeyBytes, maxAttrMethodBytes)
 
 // attrBudget is what one top-level attribute may still expand. A LogValuer
 // can return a group that contains itself, or branches to itself twice;
@@ -147,47 +148,26 @@ var attrLimitMarker = fmt.Sprintf("[attribute limit reached: %d attributes, %d k
 // Each top-level attribute gets its own, so one runaway value cannot crowd
 // out its siblings (a request ID logged after it, say).
 type attrBudget struct {
-	left         int // attributes
-	keyBytes     int // flattened key bytes
-	payloadBytes int // value bytes below the top level
+	left        int // attributes
+	keyBytes    int // flattened key bytes
+	methodBytes int // Error() and String() text
 }
 
 func newAttrBudget() *attrBudget {
-	return &attrBudget{left: maxAttrExpansion, keyBytes: maxAttrKeyBytes, payloadBytes: maxAttrPayloadBytes}
+	return &attrBudget{left: maxAttrExpansion, keyBytes: maxAttrKeyBytes, methodBytes: maxAttrMethodBytes}
 }
 
-// leafSize measures the encoded size of an extracted value the way the
-// formatters will write it. Values that are not plain strings or scalars
-// are encoded to measure them; that cost is bounded by the payload budget
-// it is charged against.
-func leafSize(v interface{}) int {
-	switch x := v.(type) {
-	case nil:
-		return len("null")
-	case string:
-		return len(x) + 2
-	case bool, int64, uint64, float64:
-		return 24
-	case time.Time:
-		// Fixed size only when it encodes; otherwise the formatters write
-		// its fallback text, which can be long (a long zone name).
-		if data, err := x.MarshalJSON(); err == nil {
-			return len(data)
-		}
-		return len(describe(x)) + 2
-	case map[string]interface{}:
-		// Measure through the formatters' map encoding: it bounds repeated
-		// and cyclic references, which plain json.Marshal expands.
-		data, err := json.Marshal(encodeFields(x))
-		if err != nil {
-			return len(describe(x)) + 2
-		}
-		return len(data)
+// hasTextMethod reports whether extractValue turns v into the text of its
+// Error or String method.
+func hasTextMethod(v slog.Value) bool {
+	if v.Kind() != slog.KindAny {
+		return false
 	}
-	if data, err := marshalValue(v); err == nil {
-		return len(data)
+	switch v.Any().(type) {
+	case error, fmt.Stringer:
+		return true
 	}
-	return len(describe(v)) + 2
+	return false
 }
 
 // boundedKey joins groups and key with ".", stopping at limit bytes.
@@ -266,20 +246,20 @@ func (h *Handler) appendAttrBudget(m map[string]interface{}, attr slog.Attr, gro
 			}
 		}
 	default:
+		// Error() and String() build their text on every call: once the
+		// budget is spent, call no more. Checked before the call, charged
+		// after, so a single value is always written in full.
+		method := hasTextMethod(attr.Value)
+		if method && b.methodBytes <= 0 {
+			b.left = 0
+			m[key] = attrLimitMarker
+			return false
+		}
+
 		// For non-group values, extract the value properly
 		val := h.extractValue(attr.Value)
-
-		// Below the top level, values may be one shared value repeated by
-		// expansion: charge them. A top-level value is the caller's own,
-		// written as is.
-		if depth > 0 {
-			size := leafSize(val)
-			if size > b.payloadBytes {
-				b.left = 0
-				m[key] = attrLimitMarker
-				return false
-			}
-			b.payloadBytes -= size
+		if s, ok := val.(string); ok && method {
+			b.methodBytes -= len(s)
 		}
 		m[key] = val
 	}

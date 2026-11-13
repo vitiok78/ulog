@@ -226,11 +226,14 @@ cannot be opened, the next write opens it again. `Write` after `Close` returns
 ### Values JSON cannot encode
 
 Both formatters encode context and extra values one by one. A value JSON
-rejects is written as a string and the rest of the record is kept: its
-`String()`/`Error()` text if it has one, `%+v` for a scalar (a channel, a func,
-`NaN`), and only the type name (`[unencodable main.User]`) for a struct, map,
-slice, array or pointer. `%+v` is not used for those because it would print
-fields JSON leaves out (`json:"-"`, unexported), which may hold secrets.
+rejects (a channel, a func, `NaN`, a struct holding one) is written as a string
+and the rest of the record is kept: its `String()`/`Error()` text if it has
+one, otherwise its `fmt` `%+v` dump. A value that refers to itself, or is too
+deep or large to print, is written as its type name only.
+
+**Secrets:** the `%+v` dump includes fields JSON leaves out (`json:"-"`,
+unexported). This is deliberate: losing the log line is the bigger risk. Keep
+secrets out of values you log, or redact them with `slog.LogValuer`.
 
 ### Size Parsing
 

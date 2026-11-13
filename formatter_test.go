@@ -520,6 +520,29 @@ func TestDescribeIsSafe(t *testing.T) {
 	selfSlice := make([]interface{}, 1)
 	selfSlice[0] = selfSlice
 
+	deep := map[string]interface{}{}
+	m := deep
+	for i := 0; i < 100; i++ {
+		next := map[string]interface{}{}
+		m["next"] = next
+		m = next
+	}
+
+	// Each level holds the previous one twice: tiny in memory, 2^30 nodes
+	// when printed.
+	var lattice interface{} = 0
+	for i := 0; i < 30; i++ {
+		lattice = []interface{}{lattice, lattice}
+	}
+
+	shared := map[string]interface{}{"a": 1}
+	type node struct {
+		Name   string
+		Parent *node
+	}
+	parent := &node{Name: "parent"}
+	parent.Parent = parent
+
 	tests := []struct {
 		name  string
 		value interface{}
@@ -528,10 +551,14 @@ func TestDescribeIsSafe(t *testing.T) {
 		{"chan", make(chan int), "0x"},
 		{"nan", math.NaN(), "NaN"},
 		{"panicky", panicky{}, "[unprintable ulog.panicky]"},
-		{"self map", createCircularReference(), "[unencodable map[string]interface {}]"},
-		{"self slice", selfSlice, "[unencodable []interface {}]"},
-		{"struct", cyclicStruct{}, "[unencodable ulog.cyclicStruct]"},
-		{"pointer", &cyclicStruct{}, "[unencodable *ulog.cyclicStruct]"},
+		{"self map", createCircularReference(), "[cyclic, too deep or too large map[string]interface {}]"},
+		{"self slice", selfSlice, "[cyclic, too deep or too large []interface {}]"},
+		{"too deep", deep, "[cyclic, too deep or too large"},
+		{"too large", lattice, "[cyclic, too deep or too large"},
+		{"struct", cyclicStruct{}, "{Ch:<nil> Next:map[]}"},
+		{"pointer", &cyclicStruct{}, "&{Ch:<nil> Next:map[]}"},
+		{"shared, not cyclic", []interface{}{shared, shared}, "[map[a:1] map[a:1]]"},
+		{"pointer cycle", parent, "Name:parent"},
 		{"stringer", stringerWithChan{}, "custom text"},
 	}
 	for _, tt := range tests {
@@ -556,7 +583,11 @@ type credentials struct {
 	Notify   chan struct{}
 }
 
-func TestFormattersKeepExcludedFieldsOut(t *testing.T) {
+// TestFormattersDumpUnencodableStructs pins a deliberate trade-off: when JSON
+// fails, the value is dumped with %+v so nothing is lost, and that dump
+// includes fields JSON hides. Change this only together with that decision
+// (see docs/ai: logs must not be lost, secrets in them are the lesser risk).
+func TestFormattersDumpUnencodableStructs(t *testing.T) {
 	record := LogRecord{
 		Message:   "login",
 		Channel:   "test",
@@ -565,7 +596,7 @@ func TestFormattersKeepExcludedFieldsOut(t *testing.T) {
 		DateTime:  time.Now(),
 		Context: map[string]interface{}{
 			"creds": credentials{User: "bob", Password: "hunter2", token: "tok-secret", Notify: make(chan struct{})},
-			"ptr":   &credentials{Password: "hunter2", token: "tok-secret", Notify: make(chan struct{})},
+			"ptr":   &credentials{User: "eve", Notify: make(chan struct{})},
 		},
 	}
 
@@ -575,13 +606,10 @@ func TestFormattersKeepExcludedFieldsOut(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Format: %v", err)
 			}
-			for _, secret := range []string{"hunter2", "tok-secret"} {
-				if strings.Contains(string(output), secret) {
-					t.Errorf("output leaks %q: %s", secret, output)
+			for _, want := range []string{"User:bob", "Password:hunter2", "token:tok-secret", "{User:eve"} {
+				if !strings.Contains(string(output), want) {
+					t.Errorf("output lacks %q: %s", want, output)
 				}
-			}
-			if !strings.Contains(string(output), "unencodable") {
-				t.Errorf("output lacks the placeholder: %s", output)
 			}
 		})
 	}

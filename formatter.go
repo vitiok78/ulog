@@ -20,8 +20,8 @@ type Formatter interface {
 // Context and Extra are encoded value by value. A value JSON cannot encode
 // (a channel, a func, a NaN, a cycle, a panicking MarshalJSON) is written as
 // a string instead, so one bad value never drops the record: its String or
-// Error text, %+v for a scalar, or just its type for a struct, map, slice,
-// array or pointer.
+// Error text, or its %+v dump. The dump includes fields JSON would hide
+// (json:"-", unexported): keeping the log line wins over hiding them.
 type JSONFormatter struct {
 	TimeFormat string
 }
@@ -159,11 +159,15 @@ func marshalValue(v interface{}) (data []byte, err error) {
 
 // describe returns a string for a value JSON cannot encode. It never panics.
 //
-// A Stringer or error gives its own text, as fmt would print it. Other
-// scalars (a channel, a func, a NaN) are printed with %+v. Anything that can
-// hold other values (struct, map, slice, array, pointer) is named by type
-// only: %+v would print the fields JSON leaves out, json:"-" and unexported
-// ones, which may hold secrets.
+// Losing the value is worse than exposing it, so describe shows as much as
+// it safely can: the value's String or Error text if it has one, otherwise
+// fmt's %+v. Note that %+v prints every field, including json:"-" and
+// unexported ones, so secrets JSON would hide can appear here.
+//
+// fmt has no cycle detection and would recurse forever on a value that
+// refers to itself through a map or slice. Such a value, or one too deep or
+// too large to walk (see maxDescribeDepth, maxDescribeNodes), is named by
+// its type instead.
 func describe(v interface{}) (s string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -178,13 +182,117 @@ func describe(v interface{}) (s string) {
 		return x.String()
 	}
 
-	switch reflect.ValueOf(v).Kind() {
-	case reflect.Bool,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128,
-		reflect.String, reflect.Chan, reflect.Func, reflect.UnsafePointer:
-		return fmt.Sprintf("%+v", v)
+	budget := maxDescribeNodes
+	if !printable(reflect.ValueOf(v), 0, map[visit]bool{}, &budget) {
+		return fmt.Sprintf("[cyclic, too deep or too large %T]", v)
 	}
-	return fmt.Sprintf("[unencodable %T]", v)
+	return fmt.Sprintf("%+v", v)
+}
+
+const (
+	// maxDescribeDepth bounds how deep describe looks into a value.
+	maxDescribeDepth = 64
+	// maxDescribeNodes bounds how many values describe visits. A structure
+	// that shares maps or slices a lot can be exponentially larger printed
+	// than in memory.
+	maxDescribeNodes = 100_000
+)
+
+// visit identifies a map or slice on the current path of printable.
+type visit struct {
+	ptr uintptr
+	len int
+	typ reflect.Type
+}
+
+// printable reports whether fmt can print v in bounded time. It follows what
+// fmt follows: maps, slices, arrays, structs and interfaces at any depth, and
+// pointers only at the top level (deeper pointers print as addresses). It is
+// conservative: it ignores String and Error methods that would stop fmt early.
+func printable(v reflect.Value, depth int, path map[visit]bool, budget *int) bool {
+	*budget--
+	if depth > maxDescribeDepth || *budget < 0 {
+		return false
+	}
+
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return true
+		}
+		return printable(v.Elem(), depth+1, path, budget)
+
+	case reflect.Pointer:
+		if depth > 0 || v.IsNil() {
+			return true
+		}
+		return printable(v.Elem(), depth+1, path, budget)
+
+	case reflect.Map:
+		if v.IsNil() {
+			return true
+		}
+		key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
+		if path[key] {
+			return false
+		}
+		path[key] = true
+		defer delete(path, key)
+
+		iter := v.MapRange()
+		for iter.Next() {
+			if !printable(iter.Key(), depth+1, path, budget) || !printable(iter.Value(), depth+1, path, budget) {
+				return false
+			}
+		}
+		return true
+
+	case reflect.Slice:
+		if v.IsNil() || !canNest(v.Type().Elem()) {
+			return true
+		}
+		key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
+		if path[key] {
+			return false
+		}
+		path[key] = true
+		defer delete(path, key)
+		return elementsPrintable(v, depth, path, budget)
+
+	case reflect.Array:
+		if !canNest(v.Type().Elem()) {
+			return true
+		}
+		return elementsPrintable(v, depth, path, budget)
+
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if !printable(v.Field(i), depth+1, path, budget) {
+				return false
+			}
+		}
+		return true
+	}
+
+	return true
+}
+
+// elementsPrintable runs printable over the elements of a slice or array.
+func elementsPrintable(v reflect.Value, depth int, path map[visit]bool, budget *int) bool {
+	for i := 0; i < v.Len(); i++ {
+		if !printable(v.Index(i), depth+1, path, budget) {
+			return false
+		}
+	}
+	return true
+}
+
+// canNest reports whether values of type t can contain other values that
+// fmt would print recursively.
+func canNest(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Interface, reflect.Pointer, reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
+		return true
+	}
+	return false
 }

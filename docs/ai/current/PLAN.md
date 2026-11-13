@@ -37,12 +37,14 @@ Decisions taken:
 - New: an empty file is never rotated, so a record larger than `maxSize`
   no longer leaves an empty archive. `TestFileWriterRotation` and
   `TestFileWriterCleanOldBackups` now write twice.
-- Formatters: the fallback is NOT `%+v` for everything, as the plan said.
-  `%+v` prints `json:"-"` and unexported fields, so a struct with a secret
-  and a channel would leak the secret (Codex review); it also has no cycle
-  detection. A failing value becomes its `String()`/`Error()` text, `%+v` for
-  scalars (chan, func, NaN, ...), and `[unencodable <type>]` for structs,
-  maps, slices, arrays and pointers. Nested `map[string]interface{}` values
+- Formatters: a failing value becomes its `String()`/`Error()` text, else
+  its `%+v` dump. The first Codex review flagged that `%+v` prints
+  `json:"-"` and unexported fields, so secrets can leak; it was briefly
+  type-name-only. User decision 2026-11-13: logs must never lose content,
+  the secret risk is accepted, so `%+v` is back (README says so,
+  `TestFormattersDumpUnencodableStructs` pins it). `%+v` has no cycle
+  detection, so a walk first checks the value (cycles through maps/slices,
+  depth 64, 100 000 nodes) and prints only the type when it fails. Nested `map[string]interface{}` values
   (the ctx group) degrade per entry, with a cycle marker. They are rebuilt
   as a safe tree and marshalled once (third Codex review: re-encoding each
   level as `RawMessage` copied a deep subtree once per level).

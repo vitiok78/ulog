@@ -157,8 +157,13 @@ var valueLimitMarker = fmt.Sprintf("[value omitted: %d bytes of values already w
 // value survive.
 func smallValue(v interface{}) (json.RawMessage, bool) {
 	switch x := v.(type) {
-	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
 	case string:
+		if len(x) > maxSmallStringBytes {
+			return nil, false
+		}
+	case json.Number:
+		// Numeric text of any length: small only when short.
 		if len(x) > maxSmallStringBytes {
 			return nil, false
 		}

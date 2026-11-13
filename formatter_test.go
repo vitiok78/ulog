@@ -917,6 +917,37 @@ func TestFormatterValueCap(t *testing.T) {
 	}
 }
 
+// TestFormatterValueCapLongNumbers: json.Number is text of any length; a
+// long one repeated past the cap must not count as small.
+func TestFormatterValueCapLongNumbers(t *testing.T) {
+	long := json.Number("1" + strings.Repeat("0", 64<<10))
+	nested := make(map[string]interface{}, 32<<10)
+	for i := 0; i < 32<<10; i++ {
+		nested[fmt.Sprintf("n%05d", i)] = long
+	}
+	record := LogRecord{Message: "numbers", Context: map[string]interface{}{"nums": nested, "id": "req-1"}}
+
+	for name, f := range map[string]Formatter{"json": NewJSONFormatter(), "text": NewTextFormatter()} {
+		t.Run(name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			output, err := f.Format(record)
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatalf("Format: %v", err)
+			}
+
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<20 {
+				t.Errorf("Format allocated %d MiB", allocated>>20)
+			}
+			if !strings.Contains(string(output), valueLimitMarker) || !strings.Contains(string(output), `"id":"req-1"`) {
+				t.Errorf("want the value marker and id in %d bytes of output", len(output))
+			}
+		})
+	}
+}
+
 // TestDumpOfSharedStringsStaysBounded: 16 384 references to one 64 KiB
 // string next to a channel. Small in memory, over 1 GiB printed with %+v.
 func TestDumpOfSharedStringsStaysBounded(t *testing.T) {

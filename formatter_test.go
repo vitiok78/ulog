@@ -516,40 +516,71 @@ func TestTextFormatterDegradesPerValue(t *testing.T) {
 }
 
 func TestDescribeIsSafe(t *testing.T) {
-	deep := map[string]interface{}{}
-	m := deep
-	for i := 0; i < 100; i++ {
-		next := map[string]interface{}{}
-		m["next"] = next
-		m = next
-	}
-
-	shared := map[string]interface{}{"a": 1}
-	type node struct {
-		Name   string
-		Parent *node
-	}
-	parent := &node{Name: "parent"}
-	parent.Parent = parent
+	selfSlice := make([]interface{}, 1)
+	selfSlice[0] = selfSlice
 
 	tests := []struct {
 		name  string
 		value interface{}
-		want  string // substring; "" = any non-empty string
+		want  string // substring
 	}{
-		{"chan", make(chan int), ""},
-		{"panicky", panicky{}, "PANIC"},
-		{"self map", createCircularReference(), "cyclic"},
-		{"too deep", deep, "too deep"},
-		{"shared, not cyclic", []interface{}{shared, shared}, "map[a:1]"},
-		{"pointer cycle", parent, "parent"},
-		{"bytes", []byte("hi"), "[104 105]"},
+		{"chan", make(chan int), "0x"},
+		{"nan", math.NaN(), "NaN"},
+		{"panicky", panicky{}, "[unprintable ulog.panicky]"},
+		{"self map", createCircularReference(), "[unencodable map[string]interface {}]"},
+		{"self slice", selfSlice, "[unencodable []interface {}]"},
+		{"struct", cyclicStruct{}, "[unencodable ulog.cyclicStruct]"},
+		{"pointer", &cyclicStruct{}, "[unencodable *ulog.cyclicStruct]"},
+		{"stringer", stringerWithChan{}, "custom text"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := describe(tt.value)
-			if got == "" || !strings.Contains(got, tt.want) {
+			if got := describe(tt.value); !strings.Contains(got, tt.want) {
 				t.Errorf("describe = %q, want it to contain %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// stringerWithChan cannot be JSON-encoded but describes itself.
+type stringerWithChan struct{ Ch chan int }
+
+func (stringerWithChan) String() string { return "custom text" }
+
+// credentials hides a secret from JSON and also holds a field JSON rejects.
+type credentials struct {
+	User     string `json:"user"`
+	Password string `json:"-"`
+	token    string
+	Notify   chan struct{}
+}
+
+func TestFormattersKeepExcludedFieldsOut(t *testing.T) {
+	record := LogRecord{
+		Message:   "login",
+		Channel:   "test",
+		Level:     200,
+		LevelName: "INFO",
+		DateTime:  time.Now(),
+		Context: map[string]interface{}{
+			"creds": credentials{User: "bob", Password: "hunter2", token: "tok-secret", Notify: make(chan struct{})},
+			"ptr":   &credentials{Password: "hunter2", token: "tok-secret", Notify: make(chan struct{})},
+		},
+	}
+
+	for name, f := range map[string]Formatter{"json": NewJSONFormatter(), "text": NewTextFormatter()} {
+		t.Run(name, func(t *testing.T) {
+			output, err := f.Format(record)
+			if err != nil {
+				t.Fatalf("Format: %v", err)
+			}
+			for _, secret := range []string{"hunter2", "tok-secret"} {
+				if strings.Contains(string(output), secret) {
+					t.Errorf("output leaks %q: %s", secret, output)
+				}
+			}
+			if !strings.Contains(string(output), "unencodable") {
+				t.Errorf("output lacks the placeholder: %s", output)
 			}
 		})
 	}

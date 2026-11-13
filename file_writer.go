@@ -167,13 +167,34 @@ func (w *FileWriter) rotate() error {
 
 // archivePath returns a name for the next archive that no file has yet.
 func (w *FileWriter) archivePath() string {
-	base := w.path + "." + w.now().Format(archiveLayout)
-	name := base
-	for n := 1; ; n++ {
+	stamp := w.now().Format(archiveLayout)
+	base := w.path + "." + stamp
+
+	// Number past the highest archive of this second rather than filling a
+	// gap: a gap left by retention would give the newest archive a lower
+	// rank than older ones, and the next cleanup would delete it.
+	next := 0
+	prefix := filepath.Base(w.path) + "."
+	if entries, err := os.ReadDir(filepath.Dir(w.path)); err == nil {
+		for _, entry := range entries {
+			suffix, ok := strings.CutPrefix(entry.Name(), prefix)
+			if !ok || !strings.HasPrefix(suffix, stamp) {
+				continue
+			}
+			if _, seq, ok := parseArchiveSuffix(suffix); ok && seq >= next {
+				next = seq + 1
+			}
+		}
+	}
+
+	for ; ; next++ {
+		name := base
+		if next > 0 {
+			name = base + "." + strconv.Itoa(next)
+		}
 		if _, err := os.Lstat(name); err != nil {
 			return name
 		}
-		name = base + "." + strconv.Itoa(n)
 	}
 }
 

@@ -18,6 +18,9 @@ Decisions taken:
 - `maxAge` uses the timestamp parsed from the archive name, not ModTime.
 - Archive names gain a `.<n>` counter (n ≥ 1) when the name is taken; such
   files count as archives and rank after the plain one of the same second.
+  The counter goes past the highest one of that second and never fills a gap
+  (Codex review: with retention on, reusing a freed lower name ranked the
+  newest archive last and deleted it).
 - Rename fails: the record is written to the active file and `Write` reports
   nothing (returning an error with `n == len(p)` would break `bufio`-style
   callers, which latch the first error). `size` restarts at 0, so the next
@@ -29,10 +32,13 @@ Decisions taken:
 - New: an empty file is never rotated, so a record larger than `maxSize`
   no longer leaves an empty archive. `TestFileWriterRotation` and
   `TestFileWriterCleanOldBackups` now write twice.
-- Formatters: `fmt.Sprintf("%+v")` has no cycle detection and would overflow
-  the stack on a cyclic map, so the fallback first walks the value (cycles
-  through maps/slices, depth cap 64) and prints only the type when unsafe.
-  Nested `map[string]interface{}` values (the ctx group) degrade per entry.
+- Formatters: the fallback is NOT `%+v` for everything, as the plan said.
+  `%+v` prints `json:"-"` and unexported fields, so a struct with a secret
+  and a channel would leak the secret (Codex review); it also has no cycle
+  detection. A failing value becomes its `String()`/`Error()` text, `%+v` for
+  scalars (chan, func, NaN, ...), and `[unencodable <type>]` for structs,
+  maps, slices, arrays and pointers. Nested `map[string]interface{}` values
+  (the ctx group) degrade per entry, with a cycle marker.
 - `go test -race` fails on `TestMultiWriterConcurrentWrite`, also on `main`:
   out of scope, see `docs/ai/todo/multiwriter-concurrency.md`.
 

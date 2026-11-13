@@ -595,6 +595,30 @@ func TestFileWriterSameSecondRotations(t *testing.T) {
 	}
 }
 
+// TestFileWriterSameSecondRotationsWithRetention keeps retention on while many
+// rotations happen in one second. Retention frees the lower names; reusing
+// them would rank the newest archive below older ones and delete it.
+func TestFileWriterSameSecondRotationsWithRetention(t *testing.T) {
+	fw, dir, _ := newTestWriter(t, 10, 1, 0)
+	base := archiveName("app.log", testClockStart)
+
+	mustWrite(t, fw, "record 00\n")
+	for k := 1; k <= 5; k++ {
+		mustWrite(t, fw, fmt.Sprintf("record %02d\n", k)) // archives record k-1
+
+		got := listArchives(t, dir, "app.log")
+		if len(got) != 1 {
+			t.Fatalf("after rotation %d: archives = %v, want 1", k, got)
+		}
+		if content, want := readFile(t, filepath.Join(dir, got[0])), fmt.Sprintf("record %02d\n", k-1); content != want {
+			t.Fatalf("after rotation %d: %s holds %q, want the newest %q", k, got[0], content, want)
+		}
+	}
+	if got := listArchives(t, dir, "app.log"); got[0] != base+".4" {
+		t.Errorf("survivor = %s, want %s", got[0], base+".4")
+	}
+}
+
 func TestFileWriterCleanOldBackupsReportsRemoveError(t *testing.T) {
 	skipIfPermissionsIgnored(t)
 	fw, dir, _ := newTestWriter(t, 0, 1, 0)

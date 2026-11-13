@@ -19,7 +19,9 @@ type Formatter interface {
 //
 // Context and Extra are encoded value by value. A value JSON cannot encode
 // (a channel, a func, a NaN, a cycle, a panicking MarshalJSON) is written as
-// its fmt "%+v" string instead, so one bad value never drops the record.
+// a string instead, so one bad value never drops the record: its String or
+// Error text, %+v for a scalar, or just its type for a struct, map, slice,
+// array or pointer.
 type JSONFormatter struct {
 	TimeFormat string
 }
@@ -158,13 +160,13 @@ func jsonString(s string) json.RawMessage {
 	return data
 }
 
-// maxDescribeDepth bounds how deep describe looks into a value before it
-// gives up and prints only the type.
-const maxDescribeDepth = 64
-
-// describe returns fmt.Sprintf("%+v", v), guarded: it never panics, and a
-// value fmt would recurse into forever (fmt has no cycle detection) or that
-// nests deeper than maxDescribeDepth is named by its type instead.
+// describe returns a string for a value JSON cannot encode. It never panics.
+//
+// A Stringer or error gives its own text, as fmt would print it. Other
+// scalars (a channel, a func, a NaN) are printed with %+v. Anything that can
+// hold other values (struct, map, slice, array, pointer) is named by type
+// only: %+v would print the fields JSON leaves out, json:"-" and unexported
+// ones, which may hold secrets.
 func describe(v interface{}) (s string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -172,106 +174,20 @@ func describe(v interface{}) (s string) {
 		}
 	}()
 
-	if !printable(reflect.ValueOf(v), 0, map[visit]bool{}) {
-		return fmt.Sprintf("[cyclic or too deep %T]", v)
-	}
-	return fmt.Sprintf("%+v", v)
-}
-
-// visit identifies a map or slice on the current path of printable.
-type visit struct {
-	ptr uintptr
-	len int
-	typ reflect.Type
-}
-
-// printable reports whether fmt can print v in finite time. It follows what
-// fmt follows: maps, slices, arrays, structs and interfaces at any depth, and
-// pointers only at the top level (deeper pointers print as addresses). It is
-// conservative: it ignores String and Error methods that would stop fmt early.
-func printable(v reflect.Value, depth int, path map[visit]bool) bool {
-	if depth > maxDescribeDepth {
-		return false
+	switch x := v.(type) {
+	case error:
+		return x.Error()
+	case fmt.Stringer:
+		return x.String()
 	}
 
-	switch v.Kind() {
-	case reflect.Interface:
-		if v.IsNil() {
-			return true
-		}
-		return printable(v.Elem(), depth+1, path)
-
-	case reflect.Pointer:
-		if depth > 0 || v.IsNil() {
-			return true
-		}
-		return printable(v.Elem(), depth+1, path)
-
-	case reflect.Map:
-		if v.IsNil() {
-			return true
-		}
-		key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
-		if path[key] {
-			return false
-		}
-		path[key] = true
-		defer delete(path, key)
-
-		iter := v.MapRange()
-		for iter.Next() {
-			if !printable(iter.Key(), depth+1, path) || !printable(iter.Value(), depth+1, path) {
-				return false
-			}
-		}
-		return true
-
-	case reflect.Slice:
-		if v.IsNil() || !canNest(v.Type().Elem()) {
-			return true
-		}
-		key := visit{ptr: v.Pointer(), len: v.Len(), typ: v.Type()}
-		if path[key] {
-			return false
-		}
-		path[key] = true
-		defer delete(path, key)
-		return elementsPrintable(v, depth, path)
-
-	case reflect.Array:
-		if !canNest(v.Type().Elem()) {
-			return true
-		}
-		return elementsPrintable(v, depth, path)
-
-	case reflect.Struct:
-		for i := 0; i < v.NumField(); i++ {
-			if !printable(v.Field(i), depth+1, path) {
-				return false
-			}
-		}
-		return true
+	switch reflect.ValueOf(v).Kind() {
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128,
+		reflect.String, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return fmt.Sprintf("%+v", v)
 	}
-
-	return true
-}
-
-// elementsPrintable runs printable over the elements of a slice or array.
-func elementsPrintable(v reflect.Value, depth int, path map[visit]bool) bool {
-	for i := 0; i < v.Len(); i++ {
-		if !printable(v.Index(i), depth+1, path) {
-			return false
-		}
-	}
-	return true
-}
-
-// canNest reports whether values of type t can contain other values that
-// fmt would print recursively.
-func canNest(t reflect.Type) bool {
-	switch t.Kind() {
-	case reflect.Interface, reflect.Pointer, reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
-		return true
-	}
-	return false
+	return fmt.Sprintf("[unencodable %T]", v)
 }

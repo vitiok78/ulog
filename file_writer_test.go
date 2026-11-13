@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	_ "time/tzdata" // LoadLocation works without system zoneinfo
 )
 
 func TestParseByteSize(t *testing.T) {
@@ -653,6 +654,33 @@ func TestFileWriterWallClockGoesBack(t *testing.T) {
 	}
 	if content := readFile(t, filepath.Join(dir, got[0])); content != "record 01\n" {
 		t.Errorf("survivor holds %q, want %q", content, "record 01\n")
+	}
+}
+
+// TestFileWriterArchiveNameInLocalDSTGap: 02:30 on 2026-03-08 does not exist
+// in New York. An archive named so (written under UTC, say) must still count
+// as an archive when the process runs in New York.
+func TestFileWriterArchiveNameInLocalDSTGap(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("LoadLocation: %v", err)
+	}
+	saved := time.Local
+	time.Local = ny
+	t.Cleanup(func() { time.Local = saved })
+
+	if _, _, ok := parseArchiveSuffix("20260308-023000"); !ok {
+		t.Fatal("20260308-023000 is not recognised as an archive timestamp")
+	}
+
+	fw, dir, _ := newTestWriter(t, 0, 0, 1)
+	gap := filepath.Join(dir, "app.log.20260308-023000")
+	writeArchive(t, gap, "old", time.Now().Add(-48*time.Hour))
+	if err := fw.cleanOldBackups(); err != nil {
+		t.Fatalf("cleanOldBackups: %v", err)
+	}
+	if _, err := os.Stat(gap); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("archive older than maxAge survived: %v", err)
 	}
 }
 

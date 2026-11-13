@@ -3,6 +3,7 @@ package ulog
 import (
 	"encoding/json"
 	"math"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -581,6 +582,44 @@ func TestFormattersKeepExcludedFieldsOut(t *testing.T) {
 			}
 			if !strings.Contains(string(output), "unencodable") {
 				t.Errorf("output lacks the placeholder: %s", output)
+			}
+		})
+	}
+}
+
+// TestDeepNestingStaysLinear: a large leaf under many nested maps must be
+// copied a fixed number of times, not once per level.
+func TestDeepNestingStaysLinear(t *testing.T) {
+	const depth, leafSize = 200, 1 << 20
+
+	leaf := strings.Repeat("x", leafSize)
+	root := map[string]interface{}{}
+	m := root
+	for i := 0; i < depth; i++ {
+		next := map[string]interface{}{}
+		m["n"] = next
+		m = next
+	}
+	m["leaf"] = leaf
+
+	record := LogRecord{Message: "deep", Context: map[string]interface{}{"root": root}}
+	for name, f := range map[string]Formatter{"json": NewJSONFormatter(), "text": NewTextFormatter()} {
+		t.Run(name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			output, err := f.Format(record)
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatalf("Format: %v", err)
+			}
+			if !strings.Contains(string(output), leaf) {
+				t.Fatal("output lacks the leaf")
+			}
+
+			// A handful of copies is fine; one per level (200 MiB) is not.
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 32*leafSize {
+				t.Errorf("Format allocated %d MiB for a %d MiB leaf", allocated>>20, leafSize>>20)
 			}
 		})
 	}

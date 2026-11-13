@@ -286,7 +286,10 @@ func parseArchiveSuffix(suffix string) (ts time.Time, seq int, ok bool) {
 	}
 	stamp, rest := suffix[:len(archiveLayout)], suffix[len(archiveLayout):]
 
-	ts, err := time.ParseInLocation(archiveLayout, stamp, time.Local)
+	// Parse as UTC: the name has no zone, and it is only checked and used to
+	// break ties. In a local zone, a name from another zone's clock could
+	// fall in a DST gap here and stop counting as an archive forever.
+	ts, err := time.Parse(archiveLayout, stamp)
 	if err != nil || ts.Format(archiveLayout) != stamp {
 		return time.Time{}, 0, false
 	}

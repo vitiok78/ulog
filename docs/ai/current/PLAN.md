@@ -43,7 +43,12 @@ Decisions taken:
   detection. A failing value becomes its `String()`/`Error()` text, `%+v` for
   scalars (chan, func, NaN, ...), and `[unencodable <type>]` for structs,
   maps, slices, arrays and pointers. Nested `map[string]interface{}` values
-  (the ctx group) degrade per entry, with a cycle marker.
+  (the ctx group) degrade per entry, with a cycle marker. They are rebuilt
+  as a safe tree and marshalled once (third Codex review: re-encoding each
+  level as `RawMessage` copied a deep subtree once per level).
+- Archive name timestamps are parsed as UTC, only to recognise names and
+  break ties (third Codex review: parsing in `time.Local` rejected names in
+  the local DST gap, and those archives escaped retention for good).
 - `go test -race` fails on `TestMultiWriterConcurrentWrite`, also on `main`:
   out of scope, see `docs/ai/todo/multiwriter-concurrency.md`.
 

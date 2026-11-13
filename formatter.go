@@ -100,16 +100,20 @@ func textFields(m map[string]interface{}) string {
 	return string(data)
 }
 
-// encodeFields encodes each value of m on its own, so a value JSON rejects
-// becomes a string and the rest stay as they are. A nil map stays nil and
-// encodes as null, as before.
-func encodeFields(m map[string]interface{}) map[string]json.RawMessage {
-	return encodeMap(m, map[uintptr]bool{})
+// encodeFields returns m with every value made safe for json.Marshal, so a
+// value JSON rejects becomes a string and the rest stay as they are. A nil
+// map stays nil and encodes as null, as before.
+//
+// Each value is encoded once here to test it, and the result is copied once
+// more by the final Marshal. Nested maps are rebuilt, not re-encoded, so the
+// cost stays linear in the size of the value however deep it nests.
+func encodeFields(m map[string]interface{}) map[string]interface{} {
+	return safeMap(m, map[uintptr]bool{})
 }
 
-// encodeMap is encodeFields with the maps on the current path in seen, so a
+// safeMap is encodeFields with the maps on the current path in seen, so a
 // map that contains itself ends in a string instead of recursing forever.
-func encodeMap(m map[string]interface{}, seen map[uintptr]bool) map[string]json.RawMessage {
+func safeMap(m map[string]interface{}, seen map[uintptr]bool) map[string]interface{} {
 	if m == nil {
 		return nil
 	}
@@ -118,30 +122,29 @@ func encodeMap(m map[string]interface{}, seen map[uintptr]bool) map[string]json.
 	seen[ptr] = true
 	defer delete(seen, ptr)
 
-	out := make(map[string]json.RawMessage, len(m))
+	out := make(map[string]interface{}, len(m))
 	for k, v := range m {
-		out[k] = encodeValue(v, seen)
+		out[k] = safeValue(v, seen)
 	}
 	return out
 }
 
-// encodeValue returns v as JSON, or its description as a JSON string when v
-// cannot be encoded. Nested map[string]interface{} values (context groups)
-// are encoded entry by entry too.
-func encodeValue(v interface{}, seen map[uintptr]bool) json.RawMessage {
+// safeValue returns v as a value json.Marshal accepts: its encoding as
+// json.RawMessage, or its description when v cannot be encoded. Nested
+// map[string]interface{} values (context groups) are made safe entry by
+// entry.
+func safeValue(v interface{}, seen map[uintptr]bool) interface{} {
 	if nested, ok := v.(map[string]interface{}); ok && nested != nil {
 		if seen[reflect.ValueOf(nested).Pointer()] {
-			return jsonString(fmt.Sprintf("[cyclic %T]", v))
+			return fmt.Sprintf("[cyclic %T]", v)
 		}
-		if data, err := json.Marshal(encodeMap(nested, seen)); err == nil {
-			return data
-		}
+		return safeMap(nested, seen)
 	}
 
 	if data, err := marshalValue(v); err == nil {
-		return data
+		return json.RawMessage(data)
 	}
-	return jsonString(describe(v))
+	return describe(v)
 }
 
 // marshalValue is json.Marshal that turns a panic into an error.
@@ -152,12 +155,6 @@ func marshalValue(v interface{}) (data []byte, err error) {
 		}
 	}()
 	return json.Marshal(v)
-}
-
-// jsonString encodes s, which never fails.
-func jsonString(s string) json.RawMessage {
-	data, _ := json.Marshal(s)
-	return data
 }
 
 // describe returns a string for a value JSON cannot encode. It never panics.

@@ -15,7 +15,12 @@ impost side not started.
 
 Decisions taken:
 
-- `maxAge` uses the timestamp parsed from the archive name, not ModTime.
+- Ranking and `maxAge` use ModTime; the name only identifies an archive and
+  breaks ties (timestamp, then counter). First done by name timestamp; the
+  second Codex review showed local names with no offset run backwards after
+  a DST fall-back, so the newest archives got deleted. UTC names were the
+  other option, rejected: a format change, and old local-time archives would
+  misorder right after the upgrade.
 - Archive names gain a `.<n>` counter (n ≥ 1) when the name is taken; such
   files count as archives and rank after the plain one of the same second.
   The counter goes past the highest one of that second and never fills a gap

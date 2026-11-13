@@ -214,7 +214,9 @@ The file writer supports automatic rotation based on:
 Archives are named `<path>.<YYYYMMDD-HHMMSS>`, with a `.1`, `.2`, … suffix when
 several rotations happen within one second. Only files named exactly like that
 count as archives; other files next to the log (`app.log.gz`, `app.log.keep-me`)
-are never counted or removed. Archive age comes from the timestamp in the name.
+are never counted or removed. Archives are ranked and aged by their
+modification time (the last write before rotation), not by the local-time name,
+which can run backwards after a DST change.
 
 A failed rotation does not stop logging: if the file cannot be renamed, records
 keep going to the active file and rotation is retried later; if the new file

@@ -200,18 +200,21 @@ func (w *FileWriter) archivePath() string {
 
 // archive is one rotated file of a FileWriter.
 type archive struct {
-	path string
-	ts   time.Time
-	seq  int
+	path    string
+	modTime time.Time
+	ts      time.Time
+	seq     int
 }
 
 // cleanOldBackups applies maxBackups and maxAge to the archives of w.path.
 //
 // Only files named <base>.<archiveLayout> or <base>.<archiveLayout>.<n> count
 // as archives; any other file in the directory is neither counted nor removed.
-// Archives are ranked newest first by the timestamp in their name, then by n.
-// Age is taken from that timestamp (the rotation time, local time zone), not
-// from the file's modification time.
+// Archives are ranked newest first by modification time (the last write
+// before rotation; a rename keeps it), and age is measured from it too. The
+// name's timestamp is local wall time with no offset and runs backwards after
+// a DST fall-back or a time zone change, so it only breaks ties: by timestamp,
+// then by n.
 //
 // Every removal is attempted; the first error is returned.
 func (w *FileWriter) cleanOldBackups() error {
@@ -233,10 +236,22 @@ func (w *FileWriter) cleanOldBackups() error {
 		if !ok {
 			continue
 		}
-		archives = append(archives, archive{path: filepath.Join(dir, entry.Name()), ts: ts, seq: seq})
+		info, err := entry.Info()
+		if err != nil {
+			continue // removed meanwhile
+		}
+		archives = append(archives, archive{
+			path:    filepath.Join(dir, entry.Name()),
+			modTime: info.ModTime(),
+			ts:      ts,
+			seq:     seq,
+		})
 	}
 
 	sort.Slice(archives, func(i, j int) bool {
+		if !archives[i].modTime.Equal(archives[j].modTime) {
+			return archives[i].modTime.After(archives[j].modTime)
+		}
 		if !archives[i].ts.Equal(archives[j].ts) {
 			return archives[i].ts.After(archives[j].ts)
 		}
@@ -251,7 +266,7 @@ func (w *FileWriter) cleanOldBackups() error {
 	var firstErr error
 	for i, a := range archives {
 		tooMany := w.maxBackups > 0 && i >= w.maxBackups
-		tooOld := w.maxAge > 0 && a.ts.Before(cutoff)
+		tooOld := w.maxAge > 0 && a.modTime.Before(cutoff)
 		if !tooMany && !tooOld {
 			continue
 		}

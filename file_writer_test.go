@@ -294,7 +294,7 @@ func TestFileWriterCleanOldBackups(t *testing.T) {
 	}
 
 	for _, backup := range oldBackups {
-		writeFile(t, filepath.Join(tempDir, backup), "old backup content")
+		writeArchive(t, filepath.Join(tempDir, backup), "old backup content", time.Now().Add(-10*24*time.Hour))
 	}
 
 	// Create FileWriter with maxBackups=3 and maxAge=7 days
@@ -377,8 +377,9 @@ func TestFileWriterImplementsInterfaces(t *testing.T) {
 	var _ io.Writer = fw
 }
 
-// testClockStart is the fake time tests start from.
-var testClockStart = time.Date(2026, 11, 13, 12, 0, 0, 0, time.Local)
+// testClockStart is the fake time tests start from. It is the real time,
+// because archives are ranked and aged by their real modification times.
+var testClockStart = time.Now().Truncate(time.Second)
 
 // newTestWriter returns a FileWriter on <tempdir>/app.log with a fake clock.
 // Assign through the returned pointer to move the clock.
@@ -411,6 +412,15 @@ func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("WriteFile(%s): %v", path, err)
+	}
+}
+
+// writeArchive creates a file with the given modification time.
+func writeArchive(t *testing.T, path, content string, modTime time.Time) {
+	t.Helper()
+	writeFile(t, path, content)
+	if err := os.Chtimes(path, modTime, modTime); err != nil {
+		t.Fatalf("Chtimes(%s): %v", path, err)
 	}
 }
 
@@ -548,7 +558,8 @@ func TestFileWriterMaxAgeAndMaxBackups(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fw, dir, _ := newTestWriter(t, 10, tt.maxBackups, 7)
 			for _, age := range ages {
-				writeFile(t, filepath.Join(dir, archiveName("app.log", testClockStart.Add(-age))), "old")
+				ts := testClockStart.Add(-age)
+				writeArchive(t, filepath.Join(dir, archiveName("app.log", ts)), "old", ts)
 			}
 
 			mustWrite(t, fw, "record 00\n")
@@ -616,6 +627,32 @@ func TestFileWriterSameSecondRotationsWithRetention(t *testing.T) {
 	}
 	if got := listArchives(t, dir, "app.log"); got[0] != base+".4" {
 		t.Errorf("survivor = %s, want %s", got[0], base+".4")
+	}
+}
+
+// TestFileWriterWallClockGoesBack covers a DST fall-back (or a time zone
+// change): the second archive gets an earlier name than the first although it
+// is newer. Ranking by name would delete it.
+func TestFileWriterWallClockGoesBack(t *testing.T) {
+	fw, dir, clock := newTestWriter(t, 10, 1, 0)
+
+	mustWrite(t, fw, "record 00\n")
+	mustWrite(t, fw, "record 01\n") // archive named 03:59-ish, holds record 00
+	first := filepath.Join(dir, archiveName("app.log", testClockStart))
+	if err := os.Chtimes(first, time.Now().Add(-time.Minute), time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	*clock = testClockStart.Add(-59 * time.Minute) // wall clock jumps back
+	mustWrite(t, fw, "record 02\n")                // archive holds record 01
+
+	got := listArchives(t, dir, "app.log")
+	want := archiveName("app.log", *clock)
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("archives = %v, want only the newest %s", got, want)
+	}
+	if content := readFile(t, filepath.Join(dir, got[0])); content != "record 01\n" {
+		t.Errorf("survivor holds %q, want %q", content, "record 01\n")
 	}
 }
 
